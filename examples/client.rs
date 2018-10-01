@@ -64,6 +64,10 @@ use tokio_timer::Delay;
 
 const RETRY_DELAY: u64 = 10;
 
+pub struct Config {
+    is_prevent_direct: bool,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Crust(CrustError),
@@ -150,6 +154,7 @@ struct Client {
     connecting_to: Option<PublicEncryptKey>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
+    config: Config,
 }
 
 impl Client {
@@ -159,12 +164,14 @@ impl Client {
         handle: Handle,
         proxy_tx: UnboundedSender<Bytes>,
         client_tx: UnboundedSender<Msg>,
+        config: Config,
     ) -> Self {
         Client {
             handle,
             proxy_tx,
             client_tx,
             name,
+            config,
             peer_names: Default::default(),
             service: Rc::new(RefCell::new(service)),
             ci_channel: None,
@@ -345,7 +352,7 @@ impl Client {
 
         match rpc_cmd {
             Rpc::GetPeerResp(name, ci_opt) => {
-                if let Some(ci) = ci_opt {
+                if let Some(mut ci) = ci_opt {
                     // Attempt to connect with peer
                     self.attempted_conns.push(ci.id());
                     if let Some(name) = name {
@@ -356,6 +363,9 @@ impl Client {
                         "Attempting to connect with {}...",
                         self.get_peer_name(ci.id())
                     );
+                    if self.config.is_prevent_direct {
+                        remove_direct_conn_info(&mut ci);
+                    }
                     unwrap!(self.ci_channel.take()).unbounded_send(ci)?;
                 } else {
                     // Retry again in some time
@@ -366,13 +376,17 @@ impl Client {
                     retry_connection(&self.handle, &self.client_tx);
                 }
             }
-            Rpc::GetPeerReq(name, theirs_ci) => {
+            Rpc::GetPeerReq(name, mut theirs_ci) => {
                 // Someone requested a direct connection with us
                 let theirs_id = theirs_ci.id();
                 if let Some(name) = name {
                     self.peer_names.insert(theirs_id, name.clone());
                 }
                 self.attempted_conns.push(theirs_id);
+
+                if self.config.is_prevent_direct {
+                    remove_direct_conn_info(&mut theirs_ci);
+                }
 
                 info!(
                     "Attempting to connect with {}...",
@@ -471,6 +485,26 @@ impl Client {
     }
 }
 
+fn remove_direct_conn_info(ci: &mut PubConnectionInfo) {
+    ci.for_direct = Vec::new();
+}
+
+fn get_user_name() -> Option<String> {
+    print!("Please enter your name (or press Enter if you don't want any): ");
+    unwrap!(io::stdout().flush());
+
+    let stdin = io::stdin();
+    let mut our_name = String::new();
+    unwrap!(stdin.lock().read_line(&mut our_name));
+    let our_name = our_name.trim().to_string();
+
+    if our_name.is_empty() {
+        None
+    } else {
+        Some(our_name)
+    }
+}
+
 fn main() {
     unwrap!(logger::init(true));
 
@@ -483,15 +517,13 @@ fn main() {
                 .short("c")
                 .takes_value(true)
                 .help("Config file path"),
+        ).arg(
+            Arg::with_name("prevent_direct")
+                .long("prevent-direct-connections")
+                .help("Prevents direct connections requiring the other side to hole punch"),
         ).get_matches();
 
-    print!("Please enter your name (or press Enter if you don't want any): ");
-    unwrap!(io::stdout().flush());
-
-    let stdin = io::stdin();
-    let mut our_name = String::new();
-    unwrap!(stdin.lock().read_line(&mut our_name));
-    let our_name = our_name.trim().to_string();
+    let our_name = get_user_name();
 
     let config = unwrap!(if let Some(cfg_path) = matches.value_of("config") {
         info!("Loading config from {}", cfg_path);
@@ -499,6 +531,7 @@ fn main() {
     } else {
         ConfigFile::open_default()
     });
+    let is_prevent_direct = matches.is_present("prevent_direct");
 
     let mut event_loop = unwrap!(Core::new());
     let handle = event_loop.handle();
@@ -525,21 +558,20 @@ fn main() {
     let client_tx3 = client_tx.clone();
 
     // Setup listeners
-    let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
-    for listener in &listeners {
-        info!("Listening on {}", listener.addr());
+    if !is_prevent_direct {
+        let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
+        for listener in &listeners {
+            info!("Listening on {}", listener.addr());
+        }
     }
 
     let mut client = Client::new(
-        if our_name.is_empty() {
-            None
-        } else {
-            Some(our_name)
-        },
+        our_name,
         svc,
         handle.clone(),
         proxy_tx.clone(),
         client_tx.clone(),
+        Config { is_prevent_direct },
     );
 
     // Transfer bytes from mpsc channel to proxy
