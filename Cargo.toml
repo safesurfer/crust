@@ -51,6 +51,7 @@ rev = "b4377ab"
 chrono = "~0.4.0"
 clap = "~2.31.1"
 hamcrest = "~0.1.5"
+tokio-timer = "~0.2.6"
 
 [features]
 default = ["netsim"]

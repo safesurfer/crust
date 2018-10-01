@@ -26,7 +26,7 @@
 #![deny(
     deprecated,
     improper_ctypes,
-    missing_docs,
+    // missing_docs,
     non_shorthand_field_patterns,
     overflowing_literals,
     plugin_as_library,
