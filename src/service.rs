@@ -173,7 +173,6 @@ impl Service {
         let config = self.config.clone();
         let demux = self.demux.clone();
         self.prepare_connection_info()
-            .map_err(|e| panic!(e)) // TODO(povilas): fix me
             .and_then(move |our_info| {
                 let (ci_tx, ci_rx) = ci_channel.split();
                 ci_tx
