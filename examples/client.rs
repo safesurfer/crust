@@ -44,13 +44,9 @@ mod common;
 
 use bytes::Bytes;
 use clap::{App, Arg};
-use common::event_loop::{spawn_event_loop, El};
+use common::event_loop::{spawn_event_loop, Core as ElCore, CoreState, El};
 use common::{LogUpdate, NatTraversalResult, Os, Rpc};
-use crust::{
-    ConfigFile, ConnectionResult, CrustError, CrustUser, PaAddr, PubConnectionInfo, Service,
-    SingleConnectionError,
-};
-use future_utils::bi_channel::{self, UnboundedBiChannel};
+use crust::{ConfigFile, CrustError, CrustUser, Service};
 use future_utils::mpsc::SendError;
 use futures::sync::mpsc::{self, UnboundedSender};
 use futures::{future::empty, Future, Sink, Stream};
@@ -58,16 +54,17 @@ use maidsafe_utilities::{
     log as logger,
     serialisation::{deserialise, serialise, SerialisationError},
 };
-use mio::Poll;
+use mio::net::UdpSocket;
+use mio::{Poll, PollOpt, Ready, Token};
 use p2p_old::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
     RendezvousInfo, Res,
 };
-// use safe_crypto::PublicEncryptKey;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
+use std::net::SocketAddr;
 use std::process;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
@@ -78,6 +75,119 @@ use tokio_timer::Delay;
 pub type PublicEncryptKey = [u8; 32];
 
 const RETRY_DELAY: u64 = 10;
+
+struct ChatEngine {
+    token: Token,
+    write_queue: VecDeque<Vec<u8>>,
+    read_buf: [u8; 1024],
+    sock: UdpSocket,
+    peer: SocketAddr,
+}
+
+impl ChatEngine {
+    fn start(
+        core: &mut ElCore,
+        poll: &Poll,
+        token: Token,
+        sock: UdpSocket,
+        peer: SocketAddr,
+    ) -> Token {
+        unwrap!(poll.reregister(
+            &sock,
+            token,
+            Ready::readable() | Ready::error() | Ready::hup(),
+            PollOpt::edge()
+        ));
+        let engine = Rc::new(RefCell::new(ChatEngine {
+            token: token,
+            write_queue: VecDeque::with_capacity(5),
+            read_buf: [0; 1024],
+            sock: sock,
+            peer: peer,
+        }));
+
+        if let Err(e) = core.insert_peer_state(token, engine) {
+            panic!("{}", e.1);
+        }
+        token
+    }
+
+    fn read(&mut self, _core: &mut ElCore, _poll: &Poll) {
+        let bytes_rxd = match self.sock.recv_from(&mut self.read_buf) {
+            Ok((bytes_rxd, _)) => bytes_rxd,
+            Err(ref e)
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+            {
+                return
+            }
+            Err(e) => panic!("Error in chat engine read: {:?}", e),
+        };
+
+        let msg = unwrap!(String::from_utf8(self.read_buf[..bytes_rxd].to_owned()));
+        println!(
+            "======================\nPEER: {}\n======================",
+            msg
+        );
+    }
+
+    fn write(&mut self, _core: &mut ElCore, poll: &Poll, m: Option<String>) {
+        let m = match m {
+            Some(m) => {
+                let text = m.as_bytes();
+                if self.write_queue.is_empty() {
+                    text.to_owned()
+                } else {
+                    self.write_queue.push_back(text.to_owned());
+                    return;
+                }
+            }
+            None => match self.write_queue.pop_front() {
+                Some(text) => text,
+                None => return,
+            },
+        };
+
+        match self.sock.send_to(&m, &self.peer) {
+            Ok(bytes_txd) => assert_eq!(bytes_txd, m.len()),
+            Err(ref e)
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+            {
+                self.write_queue.push_front(m)
+            }
+            Err(e) => panic!("Error in chat engine write: {:?}", e),
+        }
+
+        let interest = if self.write_queue.is_empty() {
+            Ready::readable() | Ready::error() | Ready::hup()
+        } else {
+            Ready::writable() | Ready::readable() | Ready::error() | Ready::hup()
+        };
+
+        unwrap!(poll.reregister(&self.sock, self.token, interest, PollOpt::edge()));
+    }
+}
+
+impl CoreState for ChatEngine {
+    fn ready(&mut self, core: &mut ElCore, poll: &Poll, event: Ready) {
+        assert!(!(event.is_error() || event.is_hup()));
+        if event.is_readable() {
+            self.read(core, poll)
+        } else if event.is_writable() {
+            self.write(core, poll, None)
+        } else {
+            panic!("Unhandled event: {:?}", event);
+        }
+    }
+
+    fn write(&mut self, core: &mut ElCore, poll: &Poll, m: String) {
+        self.write(core, poll, Some(m))
+    }
+
+    fn terminate(&mut self, core: &mut ElCore, poll: &Poll) {
+        let _ = core.remove_state(self.token);
+        let _ = poll.deregister(&self.sock);
+    }
+}
 
 pub struct Config {
     is_prevent_direct: bool,
@@ -124,12 +234,15 @@ impl From<String> for Error {
 
 #[derive(Debug)]
 enum Msg {
-    // ConnectionInfo(PubConnectionInfo, UnboundedBiChannel<PubConnectionInfo>),
     Incoming(Rpc),
-    Stats(LogUpdate),
     RetryConnect,
     Terminate,
-    ConnectedWithPeer(PublicEncryptKey, Result<HolePunchInfo, NatError>, bool),
+    ConnectedWithPeer(
+        RendezvousInfo,
+        PublicEncryptKey,
+        Result<HolePunchInfo, NatError>,
+        bool,
+    ),
 }
 
 /// Detects OS type
@@ -160,12 +273,12 @@ struct Client {
     handle: Handle,
     proxy_tx: UnboundedSender<Bytes>,
     client_tx: UnboundedSender<Msg>,
-    ci_channel: Option<UnboundedBiChannel<PubConnectionInfo>>,
     service: Rc<RefCell<Service>>,
     successful_conns: Vec<PublicEncryptKey>,
     attempted_conns: Vec<PublicEncryptKey>,
     failed_conns: Vec<PublicEncryptKey>,
     connecting_to: Option<PublicEncryptKey>,
+    our_ci: Option<RendezvousInfo>,
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
@@ -192,30 +305,23 @@ impl Client {
             p2p_handle: None,
             peer_names: Default::default(),
             service: Rc::new(RefCell::new(service)),
-            ci_channel: None,
             successful_conns: Vec::new(),
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
             connecting_to: None,
+            our_ci: None,
             p2p_el,
         }
     }
 
     fn connected_with_peer(
         &mut self,
+        our_ci: RendezvousInfo,
         peer_id: PublicEncryptKey,
         conn_res: Result<HolePunchInfo, NatError>,
         send_stats: bool,
     ) -> Result<(), Error> {
         let is_successful = conn_res.is_ok();
-
-        // let is_successful = conn_res.iter().fold(false, |prev, res| {
-        //     if prev == false {
-        //         res.result.is_ok()
-        //     } else {
-        //         prev
-        //     }
-        // });
 
         if is_successful {
             self.successful_conns.push(peer_id);
@@ -255,12 +361,33 @@ impl Client {
             },
             self.get_peer_name(peer_id),
         );
-        info!("Results: {:?}", conn_res);
 
-        // // Send stats only if the requester is us
+        if let Ok(HolePunchInfo {
+            ref tcp, ref udp, ..
+        }) = conn_res
+        {
+            info!("TCP our CI: {:?}", our_ci.tcp);
+
+            if let Some((tcp, _token)) = tcp {
+                info!("TCP peer: {:?}", tcp.peer_addr());
+            } else {
+                info!("TCP HP failed");
+            }
+
+            info!("UDP our CI: {:?}", our_ci.udp);
+
+            if let Some((_udp_bound, udp_peer, _token)) = udp {
+                info!("UDP peer: {:?}", udp_peer);
+            } else {
+                info!("UDP HP failed");
+            }
+        }
+
+        // Send stats only if the requester is us
         if send_stats {
             let log_upd = self.aggregate_stats(peer_id, conn_res);
-            unwrap!(self.client_tx.unbounded_send(Msg::Stats(log_upd)));
+            info!("Sending stats {:?}", log_upd);
+            self.send_rpc(&Rpc::UploadLog(log_upd))?;
         }
 
         Ok(())
@@ -286,7 +413,7 @@ impl Client {
         peer: PublicEncryptKey,
         conn_res: Result<HolePunchInfo, NatError>,
     ) -> LogUpdate {
-        let mut is_direct_successful = false;
+        let is_direct_successful = false;
 
         let mut tcp_hole_punch_result = NatTraversalResult::Failed;
         let mut udp_hole_punch_result = NatTraversalResult::Failed;
@@ -313,23 +440,6 @@ impl Client {
         let bytes = serialise(&rpc)?;
         self.proxy_tx.unbounded_send(Bytes::from(bytes))?;
         Ok(())
-    }
-
-    // fn set_new_conn_info(
-    //     &mut self,
-    //     our_ci: PubConnectionInfo,
-    //     ci_chan: UnboundedBiChannel<PubConnectionInfo>,
-    // ) -> Result<(), Error> {
-    //     info!("Updating our connection info");
-
-    //     self.our_ci = Some(our_ci.clone());
-    //     self.ci_channel = Some(ci_chan);
-
-    //     self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), our_ci))
-    // }
-
-    fn send_stats(&self, stats: LogUpdate) -> Result<(), Error> {
-        self.send_rpc(&Rpc::UploadLog(stats))
     }
 
     fn get_peer_name(&self, id: PublicEncryptKey) -> String {
@@ -359,14 +469,18 @@ impl Client {
 
                     let id = ci.enc_pk;
                     let client_tx = self.client_tx.clone();
+                    let our_ci = unwrap!(self.our_ci.take());
 
                     unwrap!(self.p2p_handle.take()).fire_hole_punch(
                         ci,
                         Box::new(move |_, _, res| {
                             // Hole punch success
-                            unwrap!(
-                                client_tx.unbounded_send(Msg::ConnectedWithPeer(id, res, true))
-                            );
+                            unwrap!(client_tx.unbounded_send(Msg::ConnectedWithPeer(
+                                our_ci.clone(),
+                                id,
+                                res,
+                                true
+                            )));
                             unwrap!(client_tx.unbounded_send(Msg::RetryConnect));
                         }),
                     );
@@ -393,34 +507,27 @@ impl Client {
                 );
 
                 let client_tx = self.client_tx.clone();;
-                let svc = self.service.borrow();
-
-                // self.handle.spawn(
-                //     svc.connect_all(ci_chan1)
-                //         .collect()
-                //         .and_then(move |conn_res| Ok(()))
-                //         .map_err(move |e| {
-                //             error!("{}", e);
-                //         }),
-                // );
-
-                let proxy_tx = self.proxy_tx.clone();
                 let name = self.name.clone();
 
                 let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
                 info!("Our responder CI: {:?}", our_ci);
 
+                let our_ci2 = our_ci.clone();
+
                 handle.fire_hole_punch(
                     theirs_ci,
                     Box::new(move |_, _, res| {
                         // Hole punch success
-                        unwrap!(
-                            client_tx.unbounded_send(Msg::ConnectedWithPeer(theirs_id, res, false))
-                        );
+                        unwrap!(client_tx.unbounded_send(Msg::ConnectedWithPeer(
+                            our_ci2.clone(),
+                            theirs_id,
+                            res,
+                            false
+                        )));
                     }),
                 );
 
-                self.send_rpc(&Rpc::GetPeerResp(name, Some(our_ci)));
+                self.send_rpc(&Rpc::GetPeerResp(name, Some(our_ci)))?;
             }
             _ => {
                 error!("Invalid command from the proxy");
@@ -434,13 +541,10 @@ impl Client {
         let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
         info!("Our requester CI: {:?}", our_ci);
 
-        self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), our_ci.clone()));
-
         self.p2p_handle = Some(handle);
+        self.our_ci = Some(our_ci.clone());
 
-        // unwrap!(client_tx2.unbounded_send(Msg::ConnectedWithPeer(None, conn_res, true)));
-        // // Disconnect and try again with another peer
-        // unwrap!(client_tx2.unbounded_send(Msg::RetryConnect));
+        self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), our_ci))?;
 
         Ok(())
     }
@@ -585,10 +689,9 @@ fn main() {
                 let res = match msg {
                     // Msg::ConnectionInfo(ci, chan) => client.set_new_conn_info(ci, chan),
                     Msg::Incoming(rpc) => client.handle_new_message(rpc),
-                    Msg::Stats(stats) => client.send_stats(stats),
                     Msg::RetryConnect => client.await_peer(),
-                    Msg::ConnectedWithPeer(peer_id, peer, send_stats) => {
-                        client.connected_with_peer(peer_id, peer, send_stats)
+                    Msg::ConnectedWithPeer(our_ci, peer_id, peer, send_stats) => {
+                        client.connected_with_peer(our_ci, peer_id, peer, send_stats)
                     }
                     Msg::Terminate => process::exit(0),
                 };

@@ -19,13 +19,11 @@
 
 pub mod event_loop;
 
-use crust::{NatType, PubConnectionInfo};
+use crust::NatType;
 use p2p_old::RendezvousInfo;
-use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 // With custom Eq/PartialEq implemented to discard `NatTraversalResult::time_spent` as we don't want to account for that in HashSet dedups
 #[derive(Serialize, Deserialize, Debug)]
