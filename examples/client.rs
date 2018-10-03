@@ -558,12 +558,15 @@ fn main() {
     let client_tx3 = client_tx.clone();
 
     // Setup listeners
-    if !is_prevent_direct {
+    let _listeners = if !is_prevent_direct {
         let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
         for listener in &listeners {
             info!("Listening on {}", listener.addr());
         }
-    }
+        listeners
+    } else {
+        vec![]
+    };
 
     let mut client = Client::new(
         our_name,
