@@ -24,6 +24,8 @@ net2 = "~0.2.31"
 notify = "~4.0.1"
 quick-error = "~1.2.0"
 rand = "~0.3.17"
+rust_sodium = "~0.10.0"
+mio = "~0.6.7"
 safe_crypto = "~0.4.0"
 serde = "~1.0.10"
 serde_derive = "~1.0.10"
@@ -42,6 +44,10 @@ version = "~0.4"
 [dependencies.p2p]
 git = "https://github.com/ustulation/p2p"
 rev = "595fa57"
+
+[dependencies.p2p_old]
+git = "https://github.com/nbaksalyar/p2p"
+rev = "9137406"
 
 [dependencies.tokio-utp]
 git = "https://github.com/maidsafe/tokio_utp"

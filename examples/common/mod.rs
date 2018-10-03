@@ -17,7 +17,10 @@
 
 //! Common utils for the bootstrap server and client.
 
+pub mod event_loop;
+
 use crust::{NatType, PubConnectionInfo};
+use p2p_old::RendezvousInfo;
 use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -28,14 +31,14 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum NatTraversalResult {
     Failed,
-    Succeeded { time_spent: Duration },
+    Succeeded,
 }
 
 impl PartialEq for NatTraversalResult {
     fn eq(&self, other: &NatTraversalResult) -> bool {
         match (self, other) {
             (NatTraversalResult::Failed, NatTraversalResult::Failed) => true,
-            (NatTraversalResult::Succeeded { .. }, NatTraversalResult::Succeeded { .. }) => true,
+            (NatTraversalResult::Succeeded, NatTraversalResult::Succeeded) => true,
             _ => false,
         }
     }
@@ -61,9 +64,9 @@ pub struct Peer {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogUpdate {
-    pub peer: PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
+    pub peer: [u8; 32], // PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
     pub is_direct_successful: bool,
-    pub utp_hole_punch_result: NatTraversalResult,
+    pub udp_hole_punch_result: NatTraversalResult,
     pub tcp_hole_punch_result: NatTraversalResult,
 }
 
@@ -74,8 +77,8 @@ pub enum Rpc {
         nat: NatType,
         os: Os,
     },
-    GetPeerReq(Option<String>, PubConnectionInfo),
-    GetPeerResp(Option<String>, Option<(PubConnectionInfo)>),
+    GetPeerReq(Option<String>, RendezvousInfo),
+    GetPeerResp(Option<String>, Option<(RendezvousInfo)>),
     UploadLog(LogUpdate),
 }
 

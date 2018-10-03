@@ -15,6 +15,10 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+extern crate mio;
+extern crate p2p_old;
+extern crate rust_sodium;
+
 extern crate bytes;
 extern crate clap;
 extern crate crust;
@@ -33,6 +37,8 @@ extern crate tokio_core;
 #[macro_use]
 extern crate unwrap;
 
+// pub type PublicEncryptKey = [u8; 32];
+
 mod common;
 
 use bytes::Bytes;
@@ -45,6 +51,7 @@ use maidsafe_utilities::{
     log as logger,
     serialisation::{deserialise, serialise},
 };
+use p2p_old::RendezvousInfo;
 use rand::Rng;
 use safe_crypto::{PublicEncryptKey, SecretEncryptKey};
 use std::collections::{HashMap, HashSet};
@@ -68,8 +75,8 @@ pub enum Error {
     Crust(CrustError),
     Unexpected(String),
     PartialPeerInfo,
-    WrongPeerPairing(PublicEncryptKey, PublicEncryptKey),
-    PeerNotFound(PublicEncryptKey),
+    WrongPeerPairing([u8; 32], [u8; 32]),
+    PeerNotFound([u8; 32]),
 }
 
 impl Display for Error {
@@ -105,15 +112,15 @@ pub struct LogEntry {
     peer_requester: common::Peer,
     peer_responder: common::Peer,
     is_direct_successful: bool,
-    utp_hole_punch_result: NatTraversalResult,
+    udp_hole_punch_result: NatTraversalResult,
     tcp_hole_punch_result: NatTraversalResult,
 }
 
 #[derive(Debug)]
 enum Msg {
     NewPeer(Peer),
-    LostPeer(PublicEncryptKey),
-    Message(PublicEncryptKey, Rpc),
+    LostPeer([u8; 32]),
+    Message([u8; 32], Rpc),
 }
 
 #[derive(Eq, PartialEq, Hash, Debug)]
@@ -124,23 +131,23 @@ enum PeerStatus {
 
 struct Proxy {
     handle: Handle,
-    peers: HashMap<PublicEncryptKey, ConnectedPeer>,
+    peers: HashMap<[u8; 32], ConnectedPeer>,
     msg_tx: UnboundedSender<Msg>,
 }
 
 struct ConnectedPeer {
-    id: PublicEncryptKey,
+    id: [u8; 32],
     addr: PaAddr,
-    conn_info: Option<PubConnectionInfo>,
+    conn_info: Option<RendezvousInfo>,
     nat: Option<NatType>,
     os: Option<Os>,
     name: Option<String>,
-    peers_known: HashMap<PublicEncryptKey, PeerStatus>,
+    peers_known: HashMap<[u8; 32], PeerStatus>,
     tx: UnboundedSender<Bytes>,
 }
 
 impl ConnectedPeer {
-    fn new(id: PublicEncryptKey, addr: PaAddr, handle: Handle, sink: SplitSink<Peer>) -> Self {
+    fn new(id: [u8; 32], addr: PaAddr, handle: Handle, sink: SplitSink<Peer>) -> Self {
         let (tx, rx) = mpsc::unbounded::<Bytes>();
         handle.spawn(sink.sink_map_err(|_| ()).send_all(rx).then(move |_| Ok(())));
 
@@ -177,8 +184,8 @@ impl Proxy {
         self.msg_tx.clone()
     }
 
-    fn lost_peer(&mut self, peer_key: PublicEncryptKey) -> Result<(), Error> {
-        info!("Disconnected peer {}", peer_key);
+    fn lost_peer(&mut self, peer_key: [u8; 32]) -> Result<(), Error> {
+        info!("Disconnected peer {:?}", peer_key);
 
         let _ = self.peers.remove(&peer_key);
         let mut needs_new_pair = None;
@@ -200,7 +207,7 @@ impl Proxy {
     }
 
     fn new_peer(&mut self, peer: Peer) -> Result<(), Error> {
-        if self.peers.contains_key(peer.public_id()) {
+        if self.peers.contains_key(&peer.public_id().into_bytes()) {
             warn!(
                 "Peer ID {} attempted to connect once again; dropping connection",
                 peer.public_id()
@@ -216,8 +223,8 @@ impl Proxy {
             unwrap!(peer.addr())
         );
 
-        let peer_key = peer.public_id().clone();
-        let peer_key2 = peer.public_id().clone();
+        let peer_key = peer.public_id().into_bytes();
+        let peer_key2 = peer.public_id().into_bytes();
         let peer_addr = unwrap!(peer.addr());
 
         let (peer_sink, peer_stream) = peer.split();
@@ -248,8 +255,8 @@ impl Proxy {
     fn connect_with_match(
         &mut self,
         name: Option<String>,
-        requester_id: PublicEncryptKey,
-        found_peer: Option<PublicEncryptKey>,
+        requester_id: [u8; 32],
+        found_peer: Option<[u8; 32]>,
     ) -> Result<(), Error> {
         if let Some(new_pair) = found_peer {
             let conn_info = {
@@ -279,7 +286,7 @@ impl Proxy {
     }
 
     /// Finds a new random pairing peer for `peer_key` to connect to.
-    fn match_peer(&self, peer_key: PublicEncryptKey) -> Option<PublicEncryptKey> {
+    fn match_peer(&self, peer_key: [u8; 32]) -> Option<[u8; 32]> {
         let peer_self = unwrap!(self.get_peer(&peer_key));
 
         let mut peer_set: HashSet<_> = self.peers.keys().collect();
@@ -287,17 +294,20 @@ impl Proxy {
 
         let known_peers: HashSet<_> = peer_self.peers_known.keys().collect();
         info!(
-            "{} already knows about {:?}",
+            "{:?} already knows about {:?}",
             peer_key,
             known_peers
                 .iter()
-                .map(|id| format!("{}", id))
+                .map(|id| format!("{:?}", id))
                 .collect::<Vec<String>>()
         );
         let unknown_peers = peer_set
             .difference(&known_peers)
             // filter out peers that don't have connection info
-            .filter(|peer| self.peers[peer].conn_info.is_some() && self.peers[peer].nat.is_some())
+            .filter(|peer| {
+                let p = unwrap!(self.peers.get(**peer));
+                p.conn_info.is_some() && p.nat.is_some()
+            })
             .collect::<Vec<_>>();
 
         rand::thread_rng()
@@ -309,20 +319,20 @@ impl Proxy {
         stats::output_log(&log)
     }
 
-    fn get_peer(&self, peer_key: &PublicEncryptKey) -> Result<&ConnectedPeer, Error> {
+    fn get_peer(&self, peer_key: &[u8; 32]) -> Result<&ConnectedPeer, Error> {
         self.peers
             .get(peer_key)
             .ok_or_else(|| Error::PeerNotFound(peer_key.clone()))
     }
 
-    fn get_peer_mut(&mut self, peer_key: &PublicEncryptKey) -> Result<&mut ConnectedPeer, Error> {
+    fn get_peer_mut(&mut self, peer_key: &[u8; 32]) -> Result<&mut ConnectedPeer, Error> {
         self.peers
             .get_mut(peer_key)
             .ok_or_else(|| Error::PeerNotFound(peer_key.clone()))
     }
 
-    fn new_message(&mut self, peer_key: PublicEncryptKey, rpc_cmd: Rpc) -> Result<(), Error> {
-        info!("got rpc {:?} from peer {}", rpc_cmd, peer_key);
+    fn new_message(&mut self, peer_key: [u8; 32], rpc_cmd: Rpc) -> Result<(), Error> {
+        info!("got rpc {:?} from peer {:?}", rpc_cmd, peer_key);
 
         match rpc_cmd {
             Rpc::UpdateDetails { name, nat, os } => {
@@ -370,7 +380,7 @@ impl Proxy {
                     peer_requester,
                     peer_responder,
                     is_direct_successful: log.is_direct_successful,
-                    utp_hole_punch_result: log.utp_hole_punch_result,
+                    udp_hole_punch_result: log.udp_hole_punch_result,
                     tcp_hole_punch_result: log.tcp_hole_punch_result,
                 })?;
             }
@@ -378,10 +388,10 @@ impl Proxy {
                 self.get_peer_mut(&peer_key)?.conn_info = Some(conn);
                 let pair = self.match_peer(peer_key);
                 info!(
-                    "Matching {} with {}",
+                    "Matching {:?} with {}",
                     peer_key,
                     if let Some(pk) = pair {
-                        format!("{}", pk)
+                        format!("{:?}", pk)
                     } else {
                         "no one".to_string()
                     }
@@ -392,7 +402,7 @@ impl Proxy {
                 // Find pairing peer
                 let mut pair_peer_key = None;
                 for (peer, status) in &self.get_peer(&peer_key)?.peers_known {
-                    info!("known {} / {:?}", peer, status);
+                    info!("known {:?} / {:?}", peer, status);
 
                     if self.get_peer(&peer)?.peers_known.get(&peer_key)
                         == Some(&PeerStatus::Pending)
@@ -404,7 +414,7 @@ impl Proxy {
                 }
 
                 if let Some(pair_peer_key) = pair_peer_key {
-                    info!("Connecting with {}", pair_peer_key);
+                    info!("Connecting with {:?}", pair_peer_key);
 
                     let pair_peer = self.get_peer_mut(&pair_peer_key)?;
                     pair_peer
