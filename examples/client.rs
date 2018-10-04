@@ -382,8 +382,6 @@ impl Client {
         peer: PublicEncryptKey,
         conn_res: Result<FullConnStats, ()>,
     ) -> LogUpdate {
-        let is_direct_successful = false;
-
         let mut tcp_hole_punch_result = NatTraversalResult::Failed;
         let mut udp_hole_punch_result = NatTraversalResult::Failed;
 
@@ -398,7 +396,6 @@ impl Client {
 
         LogUpdate {
             peer,
-            is_direct_successful,
             udp_hole_punch_result,
             tcp_hole_punch_result,
         }

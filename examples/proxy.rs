@@ -111,7 +111,6 @@ impl From<String> for Error {
 pub struct LogEntry {
     peer_requester: common::Peer,
     peer_responder: common::Peer,
-    is_direct_successful: bool,
     udp_hole_punch_result: NatTraversalResult,
     tcp_hole_punch_result: NatTraversalResult,
 }
@@ -239,8 +238,14 @@ impl Proxy {
         self.handle.spawn(
             peer_stream
                 .for_each(move |bytes| {
-                    let rpc: Rpc = unwrap!(deserialise(&*bytes));
-                    unwrap!(msg_tx.unbounded_send(Msg::Message(peer_key, rpc)));
+                    match deserialise(&*bytes) {
+                        Ok(rpc) => {
+                            unwrap!(msg_tx.unbounded_send(Msg::Message(peer_key, rpc)));
+                        }
+                        Err(e) => {
+                            error!("{}", e);
+                        }
+                    }
                     Ok(())
                 }).then(move |_| {
                     unwrap!(msg_tx2.unbounded_send(Msg::LostPeer(peer_key2)));
@@ -379,7 +384,6 @@ impl Proxy {
                 self.add_log(LogEntry {
                     peer_requester,
                     peer_responder,
-                    is_direct_successful: log.is_direct_successful,
                     udp_hole_punch_result: log.udp_hole_punch_result,
                     tcp_hole_punch_result: log.tcp_hole_punch_result,
                 })?;

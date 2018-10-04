@@ -63,7 +63,6 @@ pub struct Peer {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogUpdate {
     pub peer: [u8; 32], // PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
-    pub is_direct_successful: bool,
     pub udp_hole_punch_result: NatTraversalResult,
     pub tcp_hole_punch_result: NatTraversalResult,
 }
