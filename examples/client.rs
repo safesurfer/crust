@@ -220,9 +220,6 @@ impl ChatEngine {
 
         // Store socket_addr
         unwrap!(self.tcp.as_mut()).our_addr = Some(socket_addr);
-
-        // Hangup on the connection
-        unwrap!(unwrap!(self.tcp_sock.take()).into_stream()).shutdown(Shutdown::Both);
     }
 
     fn write_tcp<T: Serialize>(&mut self, ifc: &mut Interface, poll: &Poll, m: Option<T>) {
@@ -300,7 +297,10 @@ impl ChatEngine {
 
 impl CoreState for ChatEngine {
     fn ready(&mut self, core: &mut ElCore, poll: &Poll, event: Ready, token: Token) {
-        assert!(!(event.is_error() || event.is_hup()));
+        if event.is_hup() || event.is_error() {
+            // Do nothing
+            return;
+        }
         if event.is_readable() {
             if self.udp.is_some() && token == unwrap!(self.udp.as_ref()).token {
                 self.read_udp(core, poll)
