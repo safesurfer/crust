@@ -65,11 +65,11 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, ErrorKind, Write};
-use std::net::SocketAddr;
-use std::process;
+use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
+use std::{process, thread};
 use tokio_core::reactor::{Core, Handle};
 use tokio_timer::Delay;
 
@@ -83,6 +83,7 @@ struct Sock {
     read_buf: [u8; 1024],
     peer: SocketAddr,
     msg: Option<SocketAddr>,
+    our_addr: Option<SocketAddr>,
 }
 
 struct ChatEngine {
@@ -90,10 +91,35 @@ struct ChatEngine {
     tcp: Option<Sock>,
     tcp_sock: Option<TcpSocket>,
     udp_sock: Option<UdpSocket>,
+    msg_tx: UnboundedSender<Msg>,
+    is_requester: bool,
+    peer_id: PublicEncryptKey,
 }
 
 impl ChatEngine {
+    fn results(&self) -> FullConnStats {
+        let tcp = if let Some(ref tcp) = self.tcp {
+            Some(ConnStats {
+                our: Some(unwrap!(tcp.our_addr)),
+                their: Some(tcp.peer),
+            })
+        } else {
+            None
+        };
+        let udp = if let Some(ref udp) = self.udp {
+            Some(ConnStats {
+                our: Some(unwrap!(udp.our_addr)),
+                their: Some(udp.peer),
+            })
+        } else {
+            None
+        };
+
+        FullConnStats { tcp, udp }
+    }
+
     fn start(
+        peer_id: PublicEncryptKey,
         is_requester: bool,
         core: &mut ElCore,
         poll: &Poll,
@@ -102,6 +128,7 @@ impl ChatEngine {
         udp_token: Token,
         udp_sock: Option<UdpSocket>,
         udp_peer: Option<SocketAddr>,
+        msg_tx: UnboundedSender<Msg>,
     ) -> (Token, Token) {
         let udp = if let Some(ref udp_sock) = udp_sock {
             Some(Sock {
@@ -110,6 +137,7 @@ impl ChatEngine {
                 read_buf: [0; 1024],
                 peer: unwrap!(udp_peer),
                 msg: Some(unwrap!(udp_peer)),
+                our_addr: None,
             })
         } else {
             None
@@ -123,6 +151,7 @@ impl ChatEngine {
                 read_buf: [0; 1024],
                 peer: tcp_peer,
                 msg: Some(tcp_peer),
+                our_addr: None,
             })
         } else {
             None
@@ -161,6 +190,9 @@ impl ChatEngine {
             tcp,
             udp_sock,
             tcp_sock,
+            msg_tx,
+            is_requester,
+            peer_id,
         }));
 
         if has_udp {
@@ -185,10 +217,12 @@ impl ChatEngine {
                 panic!("Tcp client errored out in read: {:?}", e);
             }
         };
-        println!(
-            "======================\nTCP PEER: {}\n======================",
-            socket_addr
-        );
+
+        // Store socket_addr
+        unwrap!(self.tcp.as_mut()).our_addr = Some(socket_addr);
+
+        // Hangup on the connection
+        unwrap!(self.tcp_sock.as_ref()).shutdown(Shutdown::Both);
     }
 
     fn write_tcp<T: Serialize>(&mut self, ifc: &mut Interface, poll: &Poll, m: Option<T>) {
@@ -217,10 +251,9 @@ impl ChatEngine {
         let sock_addr = unwrap!(deserialise::<SocketAddr>(
             &unwrap!(self.udp.as_ref()).read_buf[..bytes_rxd]
         ));
-        println!(
-            "======================\nPEER UDP: {}\n======================",
-            sock_addr
-        );
+
+        // Store socket_addr
+        unwrap!(self.udp.as_mut()).our_addr = Some(sock_addr);
     }
 
     fn write_udp(&mut self, _core: &mut ElCore, poll: &Poll, m: Option<Vec<u8>>) {
@@ -290,12 +323,18 @@ impl CoreState for ChatEngine {
         }
     }
 
-    fn write(&mut self, core: &mut ElCore, poll: &Poll, m: String) {
+    fn write(&mut self, _core: &mut ElCore, _poll: &Poll, _m: String) {
         unreachable!("Called write")
-        // self.write(core, poll, Some(m))
     }
 
     fn terminate(&mut self, core: &mut ElCore, poll: &Poll) {
+        // Send the results
+        unwrap!(self.msg_tx.unbounded_send(Msg::ConnResults(
+            self.peer_id,
+            self.results(),
+            self.is_requester
+        )));
+
         if let Some(ref udp) = self.udp {
             let _ = core.remove_state(udp.token);
         }
@@ -309,10 +348,6 @@ impl CoreState for ChatEngine {
             let _ = poll.deregister(tcp_sock);
         }
     }
-}
-
-pub struct Config {
-    is_prevent_direct: bool,
 }
 
 #[derive(Debug)]
@@ -365,6 +400,7 @@ enum Msg {
         Result<HolePunchInfo, NatError>,
         bool,
     ),
+    ConnResults(PublicEncryptKey, FullConnStats, bool),
 }
 
 /// Detects OS type
@@ -391,14 +427,16 @@ fn retry_connection(handle: &Handle, tx: &UnboundedSender<Msg>) {
     );
 }
 
+#[derive(Debug)]
 struct ConnStats {
-    tcp: Option<SocketAddr>,
-    udp: Option<SocketAddr>,
+    our: Option<SocketAddr>,
+    their: Option<SocketAddr>,
 }
 
+#[derive(Debug)]
 struct FullConnStats {
-    our: ConnStats,
-    their: ConnStats,
+    tcp: Option<ConnStats>,
+    udp: Option<ConnStats>,
 }
 
 struct Client {
@@ -414,7 +452,6 @@ struct Client {
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
-    config: Config,
     p2p_el: El,
 }
 
@@ -425,7 +462,6 @@ impl Client {
         handle: Handle,
         proxy_tx: UnboundedSender<Bytes>,
         client_tx: UnboundedSender<Msg>,
-        config: Config,
         p2p_el: El,
     ) -> Self {
         Client {
@@ -433,7 +469,6 @@ impl Client {
             proxy_tx,
             client_tx,
             name,
-            config,
             p2p_handle: None,
             peer_names: Default::default(),
             service: Rc::new(RefCell::new(service)),
@@ -453,11 +488,11 @@ impl Client {
         conn_res: Result<HolePunchInfo, NatError>,
         is_requester: bool,
     ) -> Result<(), Error> {
-        let HolePunchInfo { tcp, udp, enc_pk } = match conn_res {
+        let HolePunchInfo { tcp, udp, .. } = match conn_res {
             Ok(conn_info) => conn_info,
-            Err(e) => {
+            Err(_e) => {
                 // could not traverse nat type
-                self.report_connection_result(our_ci, peer_id, Err(()), is_requester);
+                self.report_connection_result(peer_id, Err(()), is_requester)?;
                 return Ok(());
             }
         };
@@ -474,8 +509,21 @@ impl Client {
             (None, None, Token(0))
         };
 
+        let tx = self.p2p_el.core_tx.clone();
+        let msg_tx = self.client_tx.clone();
+
         unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
+            let timer_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_secs(5));
+
+                // Cancel awaiting for results
+                if let Some(chat_engine) = core.peer_state(tcp_token) {
+                    chat_engine.borrow().terminate(core, poll);
+                }
+            });
+
             let _tokens = ChatEngine::start(
+                peer_id,
                 is_requester,
                 core,
                 poll,
@@ -484,23 +532,19 @@ impl Client {
                 udp_token,
                 udp_sock,
                 udp_peer,
+                msg_tx,
             );
 
-            // let chat_engine = unwrap!(core.peer_state(tcp_token));
-            // chat_engine
-            //     .borrow_mut()
-            //     .write(core, poll, "hello".to_owned());
+            // self.report_connection_result(peer_id, conn_res, is_requester);
         })));
 
-        //self.report_connection_result(our_ci, peer_id, conn_res, send_stats);
         Ok(())
     }
 
     fn report_connection_result(
         &mut self,
-        our_ci: RendezvousInfo,
         peer_id: PublicEncryptKey,
-        conn_res: Result<FullConnStats, ()>, // Result<HolePunchInfo, NatError>,
+        conn_res: Result<FullConnStats, ()>,
         send_stats: bool,
     ) -> Result<(), Error> {
         let is_successful = conn_res.is_ok();
@@ -533,46 +577,60 @@ impl Client {
                 .collect::<Vec<String>>()
         );
 
-        // // Connected to peer
-        // info!(
-        //     "!!! {} with {} !!!",
-        //     if is_successful {
-        //         "Sucessfully connected"
-        //     } else {
-        //         "Failed to connect"
-        //     },
-        //     self.get_peer_name(peer_id),
-        // );
+        // Connected to peer
+        info!(
+            "!!! {} with {} !!!",
+            if is_successful {
+                "Sucessfully connected"
+            } else {
+                "Failed to connect"
+            },
+            self.get_peer_name(peer_id),
+        );
 
-        // if let Ok(ConnStats {
-        //     ref tcp_peer,
-        //     ref udp_peer,
-        //     ..
-        // }) = conn_res
-        // {
-        //     info!("TCP our CI: {:?}", our_ci.tcp);
+        if let Ok(FullConnStats { ref tcp, .. }) = conn_res {
+            info!(
+                "TCP result: {}",
+                if let Some(tcp) = tcp {
+                    format!(
+                        "{} (us) <-> {} (them)",
+                        tcp.our
+                            .map(|ip| format!("{}", ip))
+                            .unwrap_or_else(|| "None".to_string()),
+                        tcp.their
+                            .map(|ip| format!("{}", ip))
+                            .unwrap_or_else(|| "None".to_string())
+                    )
+                } else {
+                    "Failed".to_owned()
+                }
+            );
+        }
+        if let Ok(FullConnStats { ref udp, .. }) = conn_res {
+            info!(
+                "UDP result: {}",
+                if let Some(udp) = udp {
+                    format!(
+                        "{} (us) <-> {} (them)",
+                        udp.our
+                            .map(|ip| format!("{}", ip))
+                            .unwrap_or_else(|| "None".to_string()),
+                        udp.their
+                            .map(|ip| format!("{}", ip))
+                            .unwrap_or_else(|| "None".to_string())
+                    )
+                } else {
+                    "Failed".to_owned()
+                }
+            );
+        }
 
-        //     if let Some(tcp) = tcp {
-        //         info!("TCP peer: {:?}", tcp.peer_addr());
-        //     } else {
-        //         info!("TCP HP failed");
-        //     }
-
-        //     info!("UDP our CI: {:?}", our_ci.udp);
-
-        //     if let Some(udp_peer) = udp_peer {
-        //         info!("UDP peer: {:?}", udp_peer);
-        //     } else {
-        //         info!("UDP HP failed");
-        //     }
-        // }
-
-        // // Send stats only if the requester is us
-        // if send_stats {
-        //     let log_upd = self.aggregate_stats(peer_id, conn_res);
-        //     info!("Sending stats {:?}", log_upd);
-        //     self.send_rpc(&Rpc::UploadLog(log_upd))?;
-        // }
+        // Send stats only if the requester is us
+        if send_stats {
+            let log_upd = self.aggregate_stats(peer_id, conn_res);
+            info!("Sending stats {:?}", log_upd);
+            self.send_rpc(&Rpc::UploadLog(log_upd))?;
+        }
 
         Ok(())
     }
@@ -595,7 +653,7 @@ impl Client {
     fn aggregate_stats(
         &self,
         peer: PublicEncryptKey,
-        conn_res: Result<HolePunchInfo, NatError>,
+        conn_res: Result<FullConnStats, ()>,
     ) -> LogUpdate {
         let is_direct_successful = false;
 
@@ -788,7 +846,6 @@ fn main() {
     } else {
         ConfigFile::open_default()
     });
-    let is_prevent_direct = matches.is_present("prevent_direct");
 
     let p2p_el = spawn_event_loop();
 
@@ -817,15 +874,10 @@ fn main() {
     let client_tx3 = client_tx.clone();
 
     // Setup listeners
-    let _listeners = if !is_prevent_direct {
-        let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
-        for listener in &listeners {
-            info!("Listening on {}", listener.addr());
-        }
-        listeners
-    } else {
-        vec![]
-    };
+    let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
+    for listener in &listeners {
+        info!("Listening on {}", listener.addr());
+    }
 
     let mut client = Client::new(
         our_name,
@@ -833,7 +885,6 @@ fn main() {
         handle.clone(),
         proxy_tx.clone(),
         client_tx.clone(),
-        Config { is_prevent_direct },
         p2p_el,
     );
 
@@ -878,6 +929,9 @@ fn main() {
                         client.connected_with_peer(our_ci, peer_id, peer, send_stats)
                     }
                     Msg::Terminate => process::exit(0),
+                    Msg::ConnResults(peer_id, results, is_requester) => {
+                        client.report_connection_result(peer_id, Ok(results), is_requester)
+                    }
                 };
                 if let Err(e) = res {
                     error!("{}", e);
