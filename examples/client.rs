@@ -100,7 +100,11 @@ impl ChatEngine {
     fn results(&self) -> FullConnStats {
         let tcp = if let Some(ref tcp) = self.tcp {
             Some(ConnStats {
-                our: Some(unwrap!(tcp.our_addr)),
+                our: if self.is_requester {
+                    Some(unwrap!(tcp.our_addr))
+                } else {
+                    None
+                },
                 their: Some(tcp.peer),
             })
         } else {
@@ -108,7 +112,11 @@ impl ChatEngine {
         };
         let udp = if let Some(ref udp) = self.udp {
             Some(ConnStats {
-                our: Some(unwrap!(udp.our_addr)),
+                our: if self.is_requester {
+                    Some(unwrap!(udp.our_addr))
+                } else {
+                    None
+                },
                 their: Some(udp.peer),
             })
         } else {
@@ -512,17 +520,6 @@ impl Client {
         let tx = self.p2p_el.core_tx.clone();
         let msg_tx = self.client_tx.clone();
 
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(5));
-
-            // Cancel awaiting for results
-            unwrap!(tx.send(CoreMsg::new(move |core, poll| {
-                if let Some(chat_engine) = core.peer_state(tcp_token) {
-                    chat_engine.borrow_mut().terminate(core, poll);
-                }
-            })));
-        });
-
         unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
             let _tokens = ChatEngine::start(
                 peer_id,
@@ -536,9 +533,18 @@ impl Client {
                 udp_peer,
                 msg_tx,
             );
-
-            // self.report_connection_result(peer_id, conn_res, is_requester);
         })));
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+
+            // Cancel awaiting for results
+            unwrap!(tx.send(CoreMsg::new(move |core, poll| {
+                if let Some(chat_engine) = core.peer_state(tcp_token) {
+                    chat_engine.borrow_mut().terminate(core, poll);
+                }
+            })));
+        });
 
         Ok(())
     }
