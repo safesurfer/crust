@@ -58,8 +58,9 @@ use mio::net::UdpSocket;
 use mio::{Poll, PollOpt, Ready, Token};
 use p2p_old::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
-    RendezvousInfo, Res,
+    RendezvousInfo, Res, Socket as TcpSocket,
 };
+use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
@@ -76,44 +77,134 @@ pub type PublicEncryptKey = [u8; 32];
 
 const RETRY_DELAY: u64 = 10;
 
-struct ChatEngine {
+struct Sock {
     token: Token,
     write_queue: VecDeque<Vec<u8>>,
     read_buf: [u8; 1024],
-    sock: UdpSocket,
     peer: SocketAddr,
+    msg: Option<SocketAddr>,
+}
+
+struct ChatEngine {
+    udp: Option<Sock>,
+    tcp: Option<Sock>,
+    tcp_sock: Option<TcpSocket>,
+    udp_sock: Option<UdpSocket>,
 }
 
 impl ChatEngine {
     fn start(
+        is_requester: bool,
         core: &mut ElCore,
         poll: &Poll,
-        token: Token,
-        sock: UdpSocket,
-        peer: SocketAddr,
-    ) -> Token {
-        unwrap!(poll.reregister(
-            &sock,
-            token,
-            Ready::readable() | Ready::error() | Ready::hup(),
-            PollOpt::edge()
-        ));
+        tcp_token: Token,
+        tcp_sock: Option<TcpSocket>,
+        udp_token: Token,
+        udp_sock: Option<UdpSocket>,
+        udp_peer: Option<SocketAddr>,
+    ) -> (Token, Token) {
+        let udp = if let Some(ref udp_sock) = udp_sock {
+            Some(Sock {
+                token: udp_token,
+                write_queue: VecDeque::with_capacity(5),
+                read_buf: [0; 1024],
+                peer: unwrap!(udp_peer),
+                msg: Some(unwrap!(udp_peer)),
+            })
+        } else {
+            None
+        };
+
+        let tcp = if let Some(ref tcp_sock) = tcp_sock {
+            let tcp_peer = unwrap!(tcp_sock.peer_addr());
+            Some(Sock {
+                token: tcp_token,
+                write_queue: VecDeque::with_capacity(5),
+                read_buf: [0; 1024],
+                peer: tcp_peer,
+                msg: Some(tcp_peer),
+            })
+        } else {
+            None
+        };
+
+        let has_udp = udp.is_some();
+        let has_tcp = tcp.is_some();
+
+        if let Some(ref udp_sock) = udp_sock {
+            unwrap!(poll.reregister(
+                udp_sock,
+                udp_token,
+                if is_requester {
+                    Ready::readable() | Ready::error() | Ready::hup()
+                } else {
+                    Ready::writable() | Ready::error() | Ready::hup()
+                },
+                PollOpt::edge()
+            ));
+        }
+        if let Some(ref tcp_sock) = tcp_sock {
+            unwrap!(poll.reregister(
+                tcp_sock,
+                tcp_token,
+                if is_requester {
+                    Ready::readable() | Ready::error() | Ready::hup()
+                } else {
+                    Ready::writable() | Ready::error() | Ready::hup()
+                },
+                PollOpt::edge()
+            ));
+        }
+
         let engine = Rc::new(RefCell::new(ChatEngine {
-            token: token,
-            write_queue: VecDeque::with_capacity(5),
-            read_buf: [0; 1024],
-            sock: sock,
-            peer: peer,
+            udp,
+            tcp,
+            udp_sock,
+            tcp_sock,
         }));
 
-        if let Err(e) = core.insert_peer_state(token, engine) {
-            panic!("{}", e.1);
+        if has_udp {
+            if let Err(e) = core.insert_peer_state(udp_token, engine.clone()) {
+                panic!("{}", e.1);
+            }
         }
-        token
+        if has_tcp {
+            if let Err(e) = core.insert_peer_state(tcp_token, engine) {
+                panic!("{}", e.1);
+            }
+        }
+
+        (udp_token, tcp_token)
     }
 
-    fn read(&mut self, _core: &mut ElCore, _poll: &Poll) {
-        let bytes_rxd = match self.sock.recv_from(&mut self.read_buf) {
+    fn read_tcp(&mut self, ifc: &mut Interface, poll: &Poll) {
+        let socket_addr = match unwrap!(self.tcp_sock.as_mut()).read::<SocketAddr>() {
+            Ok(Some(addr)) => addr,
+            Ok(None) => return,
+            Err(e) => {
+                panic!("Tcp client errored out in read: {:?}", e);
+            }
+        };
+        println!(
+            "======================\nTCP PEER: {}\n======================",
+            socket_addr
+        );
+    }
+
+    fn write_tcp<T: Serialize>(&mut self, ifc: &mut Interface, poll: &Poll, m: Option<T>) {
+        match unwrap!(self.tcp_sock.as_mut()).write(poll, unwrap!(self.tcp.as_ref()).token, m) {
+            Ok(true) => (),
+            Ok(false) => (),
+            Err(e) => {
+                panic!("Error in chat engine TCP read: {:?}", e);
+            }
+        }
+    }
+
+    fn read_udp(&mut self, _core: &mut ElCore, _poll: &Poll) {
+        let bytes_rxd = match unwrap!(self.udp_sock.as_ref())
+            .recv_from(&mut unwrap!(self.udp.as_mut()).read_buf)
+        {
             Ok((bytes_rxd, _)) => bytes_rxd,
             Err(ref e)
                 if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
@@ -123,69 +214,100 @@ impl ChatEngine {
             Err(e) => panic!("Error in chat engine read: {:?}", e),
         };
 
-        let msg = unwrap!(String::from_utf8(self.read_buf[..bytes_rxd].to_owned()));
+        let sock_addr = unwrap!(deserialise::<SocketAddr>(
+            &unwrap!(self.udp.as_ref()).read_buf[..bytes_rxd]
+        ));
         println!(
-            "======================\nPEER: {}\n======================",
-            msg
+            "======================\nPEER UDP: {}\n======================",
+            sock_addr
         );
     }
 
-    fn write(&mut self, _core: &mut ElCore, poll: &Poll, m: Option<String>) {
+    fn write_udp(&mut self, _core: &mut ElCore, poll: &Poll, m: Option<Vec<u8>>) {
         let m = match m {
             Some(m) => {
-                let text = m.as_bytes();
-                if self.write_queue.is_empty() {
-                    text.to_owned()
+                let text = m.clone();
+                if unwrap!(self.udp.as_ref()).write_queue.is_empty() {
+                    text
                 } else {
-                    self.write_queue.push_back(text.to_owned());
+                    unwrap!(self.udp.as_mut()).write_queue.push_back(text);
                     return;
                 }
             }
-            None => match self.write_queue.pop_front() {
+            None => match unwrap!(self.udp.as_mut()).write_queue.pop_front() {
                 Some(text) => text,
                 None => return,
             },
         };
 
-        match self.sock.send_to(&m, &self.peer) {
+        match unwrap!(self.udp_sock.as_ref()).send_to(&m, &unwrap!(self.udp.as_ref()).peer) {
             Ok(bytes_txd) => assert_eq!(bytes_txd, m.len()),
             Err(ref e)
                 if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
             {
-                self.write_queue.push_front(m)
+                unwrap!(self.udp.as_mut()).write_queue.push_front(m)
             }
             Err(e) => panic!("Error in chat engine write: {:?}", e),
         }
 
-        let interest = if self.write_queue.is_empty() {
+        let interest = if unwrap!(self.udp.as_ref()).write_queue.is_empty() {
             Ready::readable() | Ready::error() | Ready::hup()
         } else {
             Ready::writable() | Ready::readable() | Ready::error() | Ready::hup()
         };
 
-        unwrap!(poll.reregister(&self.sock, self.token, interest, PollOpt::edge()));
+        unwrap!(poll.reregister(
+            unwrap!(self.udp_sock.as_ref()),
+            unwrap!(self.udp.as_ref()).token,
+            interest,
+            PollOpt::edge()
+        ));
     }
 }
 
 impl CoreState for ChatEngine {
-    fn ready(&mut self, core: &mut ElCore, poll: &Poll, event: Ready) {
+    fn ready(&mut self, core: &mut ElCore, poll: &Poll, event: Ready, token: Token) {
         assert!(!(event.is_error() || event.is_hup()));
         if event.is_readable() {
-            self.read(core, poll)
+            if self.udp.is_some() && token == unwrap!(self.udp.as_ref()).token {
+                self.read_udp(core, poll)
+            } else if self.tcp.is_some() && token == unwrap!(self.tcp.as_ref()).token {
+                self.read_tcp(core, poll)
+            }
         } else if event.is_writable() {
-            self.write(core, poll, None)
+            if self.udp.is_some() && token == unwrap!(self.udp.as_ref()).token {
+                let msg = unwrap!(self.udp.as_mut())
+                    .msg
+                    .take()
+                    .map(|m| unwrap!(serialise(&m)));
+                self.write_udp(core, poll, msg)
+            } else if self.tcp.is_some() && token == unwrap!(self.tcp.as_ref()).token {
+                let msg = unwrap!(self.tcp.as_mut()).msg.take();
+                self.write_tcp(core, poll, msg)
+            }
         } else {
             panic!("Unhandled event: {:?}", event);
         }
     }
 
     fn write(&mut self, core: &mut ElCore, poll: &Poll, m: String) {
-        self.write(core, poll, Some(m))
+        unreachable!("Called write")
+        // self.write(core, poll, Some(m))
     }
 
     fn terminate(&mut self, core: &mut ElCore, poll: &Poll) {
-        let _ = core.remove_state(self.token);
-        let _ = poll.deregister(&self.sock);
+        if let Some(ref udp) = self.udp {
+            let _ = core.remove_state(udp.token);
+        }
+        if let Some(ref tcp) = self.tcp {
+            let _ = core.remove_state(tcp.token);
+        }
+        if let Some(ref udp_sock) = self.udp_sock {
+            let _ = poll.deregister(udp_sock);
+        }
+        if let Some(ref tcp_sock) = self.tcp_sock {
+            let _ = poll.deregister(tcp_sock);
+        }
     }
 }
 
@@ -329,44 +451,45 @@ impl Client {
         our_ci: RendezvousInfo,
         peer_id: PublicEncryptKey,
         conn_res: Result<HolePunchInfo, NatError>,
-        send_stats: bool,
+        is_requester: bool,
     ) -> Result<(), Error> {
         let HolePunchInfo { tcp, udp, enc_pk } = match conn_res {
             Ok(conn_info) => conn_info,
             Err(e) => {
                 // could not traverse nat type
-                self.report_connection_result(our_ci, peer_id, Err(()), send_stats);
+                self.report_connection_result(our_ci, peer_id, Err(()), is_requester);
                 return Ok(());
             }
         };
 
-        let (sock, peer, token) = match (udp, tcp) {
-            (Some(info), Some(_)) => {
-                // both tcp and udp - choosing udp
-                info
-            }
-            (Some(info), None) => {
-                // only udp
-                info
-            }
-            (None, Some(_)) => {
-                // only tcp
-                self.report_connection_result(our_ci, peer_id, Err(()), send_stats);
-                return Ok(());
-            }
-            (None, None) => unreachable!(
-                "This condition should not have been passed over to the user \
-                 code!"
-            ),
+        let (tcp_sock, tcp_token) = if let Some((tcp_stream, tcp_token)) = tcp {
+            (Some(TcpSocket::wrap(tcp_stream)), tcp_token)
+        } else {
+            (None, Token(0))
+        };
+
+        let (udp_sock, udp_peer, udp_token) = if let Some((udp_sock, udp_peer, udp_token)) = udp {
+            (Some(udp_sock), Some(udp_peer), udp_token)
+        } else {
+            (None, None, Token(0))
         };
 
         unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
-            let _token = ChatEngine::start(core, poll, token, sock, peer);
+            let _tokens = ChatEngine::start(
+                is_requester,
+                core,
+                poll,
+                tcp_token,
+                tcp_sock,
+                udp_token,
+                udp_sock,
+                udp_peer,
+            );
 
-            let chat_engine = unwrap!(core.peer_state(token));
-            chat_engine
-                .borrow_mut()
-                .write(core, poll, "hello".to_owned());
+            // let chat_engine = unwrap!(core.peer_state(tcp_token));
+            // chat_engine
+            //     .borrow_mut()
+            //     .write(core, poll, "hello".to_owned());
         })));
 
         //self.report_connection_result(our_ci, peer_id, conn_res, send_stats);

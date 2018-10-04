@@ -61,7 +61,7 @@ impl Core {
             return nat_state.borrow_mut().ready(self, poll, kind);
         }
         if let Some(peer_state) = self.peer_states.get(&token).cloned() {
-            return peer_state.borrow_mut().ready(self, poll, kind);
+            return peer_state.borrow_mut().ready(self, poll, kind, token);
         }
     }
 }
@@ -123,7 +123,7 @@ impl Interface for Core {
 }
 
 pub trait CoreState {
-    fn ready(&mut self, &mut Core, &Poll, Ready);
+    fn ready(&mut self, &mut Core, &Poll, Ready, Token);
     fn terminate(&mut self, &mut Core, &Poll);
     fn write(&mut self, &mut Core, &Poll, String);
 }
