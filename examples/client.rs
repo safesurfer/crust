@@ -44,7 +44,7 @@ mod common;
 
 use bytes::Bytes;
 use clap::{App, Arg};
-use common::event_loop::{spawn_event_loop, Core as ElCore, CoreState, El};
+use common::event_loop::{spawn_event_loop, Core as ElCore, CoreMsg, CoreState, El};
 use common::{LogUpdate, NatTraversalResult, Os, Rpc};
 use crust::{ConfigFile, CrustError, CrustUser, Service};
 use future_utils::mpsc::SendError;
@@ -269,6 +269,16 @@ fn retry_connection(handle: &Handle, tx: &UnboundedSender<Msg>) {
     );
 }
 
+struct ConnStats {
+    tcp: Option<SocketAddr>,
+    udp: Option<SocketAddr>,
+}
+
+struct FullConnStats {
+    our: ConnStats,
+    their: ConnStats,
+}
+
 struct Client {
     handle: Handle,
     proxy_tx: UnboundedSender<Bytes>,
@@ -321,6 +331,55 @@ impl Client {
         conn_res: Result<HolePunchInfo, NatError>,
         send_stats: bool,
     ) -> Result<(), Error> {
+        let HolePunchInfo { tcp, udp, enc_pk } = match conn_res {
+            Ok(conn_info) => conn_info,
+            Err(e) => {
+                // could not traverse nat type
+                self.report_connection_result(our_ci, peer_id, Err(()), send_stats);
+                return Ok(());
+            }
+        };
+
+        let (sock, peer, token) = match (udp, tcp) {
+            (Some(info), Some(_)) => {
+                // both tcp and udp - choosing udp
+                info
+            }
+            (Some(info), None) => {
+                // only udp
+                info
+            }
+            (None, Some(_)) => {
+                // only tcp
+                self.report_connection_result(our_ci, peer_id, Err(()), send_stats);
+                return Ok(());
+            }
+            (None, None) => unreachable!(
+                "This condition should not have been passed over to the user \
+                 code!"
+            ),
+        };
+
+        unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
+            let _token = ChatEngine::start(core, poll, token, sock, peer);
+
+            let chat_engine = unwrap!(core.peer_state(token));
+            chat_engine
+                .borrow_mut()
+                .write(core, poll, "hello".to_owned());
+        })));
+
+        //self.report_connection_result(our_ci, peer_id, conn_res, send_stats);
+        Ok(())
+    }
+
+    fn report_connection_result(
+        &mut self,
+        our_ci: RendezvousInfo,
+        peer_id: PublicEncryptKey,
+        conn_res: Result<FullConnStats, ()>, // Result<HolePunchInfo, NatError>,
+        send_stats: bool,
+    ) -> Result<(), Error> {
         let is_successful = conn_res.is_ok();
 
         if is_successful {
@@ -351,44 +410,46 @@ impl Client {
                 .collect::<Vec<String>>()
         );
 
-        // Connected to peer
-        info!(
-            "!!! {} with {} !!!",
-            if is_successful {
-                "Sucessfully connected"
-            } else {
-                "Failed to connect"
-            },
-            self.get_peer_name(peer_id),
-        );
+        // // Connected to peer
+        // info!(
+        //     "!!! {} with {} !!!",
+        //     if is_successful {
+        //         "Sucessfully connected"
+        //     } else {
+        //         "Failed to connect"
+        //     },
+        //     self.get_peer_name(peer_id),
+        // );
 
-        if let Ok(HolePunchInfo {
-            ref tcp, ref udp, ..
-        }) = conn_res
-        {
-            info!("TCP our CI: {:?}", our_ci.tcp);
+        // if let Ok(ConnStats {
+        //     ref tcp_peer,
+        //     ref udp_peer,
+        //     ..
+        // }) = conn_res
+        // {
+        //     info!("TCP our CI: {:?}", our_ci.tcp);
 
-            if let Some((tcp, _token)) = tcp {
-                info!("TCP peer: {:?}", tcp.peer_addr());
-            } else {
-                info!("TCP HP failed");
-            }
+        //     if let Some(tcp) = tcp {
+        //         info!("TCP peer: {:?}", tcp.peer_addr());
+        //     } else {
+        //         info!("TCP HP failed");
+        //     }
 
-            info!("UDP our CI: {:?}", our_ci.udp);
+        //     info!("UDP our CI: {:?}", our_ci.udp);
 
-            if let Some((_udp_bound, udp_peer, _token)) = udp {
-                info!("UDP peer: {:?}", udp_peer);
-            } else {
-                info!("UDP HP failed");
-            }
-        }
+        //     if let Some(udp_peer) = udp_peer {
+        //         info!("UDP peer: {:?}", udp_peer);
+        //     } else {
+        //         info!("UDP HP failed");
+        //     }
+        // }
 
-        // Send stats only if the requester is us
-        if send_stats {
-            let log_upd = self.aggregate_stats(peer_id, conn_res);
-            info!("Sending stats {:?}", log_upd);
-            self.send_rpc(&Rpc::UploadLog(log_upd))?;
-        }
+        // // Send stats only if the requester is us
+        // if send_stats {
+        //     let log_upd = self.aggregate_stats(peer_id, conn_res);
+        //     info!("Sending stats {:?}", log_upd);
+        //     self.send_rpc(&Rpc::UploadLog(log_upd))?;
+        // }
 
         Ok(())
     }
