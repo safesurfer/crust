@@ -65,7 +65,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, ErrorKind, Write};
-use std::net::{Shutdown, SocketAddr};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -511,11 +511,17 @@ impl Client {
             (None, Token(0))
         };
 
-        let (udp_sock, udp_peer, udp_token) = if let Some((udp_sock, udp_peer, udp_token)) = udp {
-            (Some(udp_sock), Some(udp_peer), udp_token)
-        } else {
-            (None, None, Token(0))
-        };
+        let (udp_sock, udp_peer, udp_our_ext_addr, udp_token) =
+            if let Some((udp_sock, udp_peer, udp_our_ext_addr, udp_token)) = udp {
+                (
+                    Some(udp_sock),
+                    Some(udp_peer),
+                    Some(udp_our_ext_addr),
+                    udp_token,
+                )
+            } else {
+                (None, None, None, Token(0))
+            };
 
         let tx = self.p2p_el.core_tx.clone();
         let msg_tx = self.client_tx.clone();
