@@ -15,10 +15,16 @@ use std::rc::Rc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[derive(Hash, Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Debug)]
+pub struct CoreTimer {
+    pub state_id: Token,
+    pub timer_id: u8,
+}
+
 pub struct Core {
     nat_states: HashMap<Token, Rc<RefCell<NatState>>>,
     peer_states: HashMap<Token, Rc<RefCell<CoreState>>>,
-    timer: Timer<NatTimer>,
+    nat_timer: Timer<NatTimer>,
     token: usize,
     config: Config,
     enc_pk: box_::PublicKey,
@@ -47,7 +53,7 @@ impl Core {
     }
 
     fn handle_nat_timer(&mut self, poll: &Poll) {
-        while let Some(nat_timer) = self.timer.poll() {
+        while let Some(nat_timer) = self.nat_timer.poll() {
             if let Some(nat_state) = self.state(nat_timer.associated_nat_state) {
                 nat_state
                     .borrow_mut()
@@ -93,11 +99,11 @@ impl Interface for Core {
         duration: Duration,
         timer_detail: NatTimer,
     ) -> Result<Timeout, TimerError> {
-        self.timer.set_timeout(duration, timer_detail)
+        self.nat_timer.set_timeout(duration, timer_detail)
     }
 
     fn cancel_timeout(&mut self, timeout: &Timeout) -> Option<NatTimer> {
-        self.timer.cancel_timeout(timeout)
+        self.nat_timer.cancel_timeout(timeout)
     }
 
     fn new_token(&mut self) -> Token {
@@ -173,10 +179,10 @@ pub fn spawn_event_loop() -> El {
         let config = unwrap!(serde_json::from_str(&content));
 
         let (enc_pk, enc_sk) = box_::gen_keypair();
-        let timer = Timer::default();
+        let nat_timer = Timer::default();
 
         unwrap!(poll.register(
-            &timer,
+            &nat_timer,
             Token(TIMER_TOKEN),
             Ready::readable() | Ready::error() | Ready::hup(),
             PollOpt::edge()
@@ -197,7 +203,7 @@ pub fn spawn_event_loop() -> El {
         let mut core = Core {
             nat_states: HashMap::with_capacity(10),
             peer_states: HashMap::with_capacity(5),
-            timer: timer,
+            nat_timer: nat_timer,
             token: NAT_RX_TOKEN + 1,
             config: config,
             enc_pk: enc_pk,

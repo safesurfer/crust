@@ -222,7 +222,7 @@ impl ChatEngine {
         unwrap!(self.tcp.as_mut()).our_addr = Some(socket_addr);
 
         // Hangup on the connection
-        unwrap!(self.tcp_sock.as_ref()).shutdown(Shutdown::Both);
+        unwrap!(unwrap!(self.tcp_sock.take()).into_stream()).shutdown(Shutdown::Both);
     }
 
     fn write_tcp<T: Serialize>(&mut self, ifc: &mut Interface, poll: &Poll, m: Option<T>) {
@@ -512,16 +512,18 @@ impl Client {
         let tx = self.p2p_el.core_tx.clone();
         let msg_tx = self.client_tx.clone();
 
-        unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
-            let timer_thread = thread::spawn(move || {
-                thread::sleep(Duration::from_secs(5));
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
 
-                // Cancel awaiting for results
+            // Cancel awaiting for results
+            unwrap!(tx.send(CoreMsg::new(move |core, poll| {
                 if let Some(chat_engine) = core.peer_state(tcp_token) {
-                    chat_engine.borrow().terminate(core, poll);
+                    chat_engine.borrow_mut().terminate(core, poll);
                 }
-            });
+            })));
+        });
 
+        unwrap!(self.p2p_el.core_tx.send(CoreMsg::new(move |core, poll| {
             let _tokens = ChatEngine::start(
                 peer_id,
                 is_requester,
