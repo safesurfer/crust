@@ -580,8 +580,25 @@ fn main() {
                     let no_hpin_tcp_totals = no_hpin.tcp_failures + no_hpin.tcp_succ;
                     let no_hpin_udp_totals = no_hpin.udp_failures + no_hpin.udp_succ;
 
+                    let hpin_stats = if hpin_tcp_totals > 0 || hpin_udp_totals > 0 {
+                        format!("TCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\n",
+                                if hpin_tcp_totals > 0 {
+                                    ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
+                                } else {
+                                    0.0
+                                },
+                                if hpin_udp_totals > 0 {
+                                    ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
+                                } else {
+                                    0.0
+                                }
+                        )
+                    } else {
+                        "".to_owned()
+                    };
+
                     info!(
-                        "\nHole Punching Stats:\n{:#?}.\n\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\nTCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\nTCP (combined) %: {}, UDP (combined) %: {}\n",
+                        "\nHole Punching Stats:\n{:#?}.\n\nSuccess stats:\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\n{}TCP (combined) %: {}, UDP (combined) %: {}\n",
                         STATS,
                         if no_hpin_tcp_totals > 0 {
                             ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
@@ -593,16 +610,7 @@ fn main() {
                         } else {
                             0.0
                         },
-                        if hpin_tcp_totals > 0 {
-                            ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
-                        } else {
-                            0.0
-                        },
-                        if hpin_udp_totals > 0 {
-                            ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
-                        } else {
-                            0.0
-                        },
+                        hpin_stats,
                         if tcp_totals > 0 {
                             ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
                         } else {
