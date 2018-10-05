@@ -21,6 +21,7 @@ pub mod event_loop;
 
 use crust::NatType;
 use p2p_old::RendezvousInfo;
+use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
@@ -62,7 +63,7 @@ pub struct Peer {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogUpdate {
-    pub peer: [u8; 32], // PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
+    pub peer: PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
     pub udp_hole_punch_result: NatTraversalResult,
     pub tcp_hole_punch_result: NatTraversalResult,
 }
@@ -74,8 +75,8 @@ pub enum Rpc {
         nat: NatType,
         os: Os,
     },
-    GetPeerReq(Option<String>, RendezvousInfo),
-    GetPeerResp(Option<String>, Option<(RendezvousInfo)>),
+    GetPeerReq(Option<String>, PublicEncryptKey, RendezvousInfo),
+    GetPeerResp(Option<String>, Option<(PublicEncryptKey, RendezvousInfo)>),
     UploadLog(LogUpdate),
 }
 

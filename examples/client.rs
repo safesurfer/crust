@@ -59,6 +59,7 @@ use p2p_old::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
     RendezvousInfo, Res,
 };
+use safe_crypto::PublicEncryptKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -71,8 +72,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio_core::reactor::{Core, Handle};
 use tokio_timer::Delay;
-
-pub type PublicEncryptKey = [u8; 32];
 
 const RETRY_DELAY: u64 = 10;
 
@@ -167,7 +166,6 @@ struct Client {
     successful_conns: Vec<PublicEncryptKey>,
     attempted_conns: Vec<PublicEncryptKey>,
     failed_conns: Vec<PublicEncryptKey>,
-    connecting_to: Option<PublicEncryptKey>,
     our_id: PublicEncryptKey,
     our_ci: Option<RendezvousInfo>,
     p2p_handle: Option<P2pHandle>,
@@ -198,7 +196,6 @@ impl Client {
             successful_conns: Vec::new(),
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
-            connecting_to: None,
             our_ci: None,
             p2p_el,
         }
@@ -346,9 +343,9 @@ impl Client {
 
     fn get_peer_name(&self, id: PublicEncryptKey) -> String {
         if let Some(name) = self.peer_names.get(&id) {
-            format!("{} ({:?})", name, id)
+            format!("{} ({})", name, id)
         } else {
-            format!("{:?}", id)
+            format!("{}", id)
         }
     }
 
@@ -357,19 +354,17 @@ impl Client {
 
         match rpc_cmd {
             Rpc::GetPeerResp(name, ci_opt) => {
-                if let Some(mut ci) = ci_opt {
+                if let Some((their_id, ci)) = ci_opt {
                     // Attempt to connect with peer
-                    self.attempted_conns.push(ci.enc_pk);
+                    self.attempted_conns.push(their_id);
                     if let Some(name) = name {
-                        self.peer_names.insert(ci.enc_pk, name.clone());
+                        self.peer_names.insert(their_id, name.clone());
                     }
-                    self.connecting_to = Some(ci.enc_pk);
                     info!(
                         "Attempting to connect with {}...",
-                        self.get_peer_name(ci.enc_pk)
+                        self.get_peer_name(their_id)
                     );
 
-                    let id = ci.enc_pk;
                     let client_tx = self.client_tx.clone();
                     let our_ci = unwrap!(self.our_ci.take());
 
@@ -379,10 +374,9 @@ impl Client {
                             // Hole punch success
                             let full_stats = collect_conn_result(&our_ci, res);
 
-                            unwrap!(
-                                client_tx
-                                    .unbounded_send(Msg::ConnectedWithPeer(id, full_stats, true))
-                            );
+                            unwrap!(client_tx.unbounded_send(Msg::ConnectedWithPeer(
+                                their_id, full_stats, true
+                            )));
 
                             unwrap!(client_tx.unbounded_send(Msg::RetryConnect));
                         }),
@@ -396,43 +390,41 @@ impl Client {
                     retry_connection(&self.handle, &self.client_tx);
                 }
             }
-            Rpc::GetPeerReq(name, theirs_ci) => {
+            Rpc::GetPeerReq(name, their_id, their_ci) => {
                 // Someone requested a direct connection with us
-                let theirs_id = theirs_ci.enc_pk;
                 if let Some(name) = name {
-                    self.peer_names.insert(theirs_id, name.clone());
+                    self.peer_names.insert(their_id, name.clone());
                 }
-                self.attempted_conns.push(theirs_id);
+                self.attempted_conns.push(their_id);
 
                 info!(
                     "Attempting to connect with {}...",
-                    self.get_peer_name(theirs_id)
+                    self.get_peer_name(their_id)
                 );
 
                 let client_tx = self.client_tx.clone();;
                 let name = self.name.clone();
 
                 let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
-                our_ci.enc_pk = self.our_id;
                 trace!("Our responder CI: {:?}", our_ci);
 
                 let our_ci2 = our_ci.clone();
 
                 handle.fire_hole_punch(
-                    theirs_ci,
+                    their_ci,
                     Box::new(move |_, _, res| {
                         // Hole punch success
                         let full_stats = collect_conn_result(&our_ci2, res);
 
                         unwrap!(
                             client_tx.unbounded_send(Msg::ConnectedWithPeer(
-                                theirs_id, full_stats, false
+                                their_id, full_stats, false
                             ))
                         );
                     }),
                 );
 
-                self.send_rpc(&Rpc::GetPeerResp(name, Some(our_ci)))?;
+                self.send_rpc(&Rpc::GetPeerResp(name, Some((self.our_id, our_ci))))?;
             }
             _ => {
                 error!("Invalid command from the proxy");
@@ -443,14 +435,13 @@ impl Client {
     }
 
     fn await_peer(&mut self) -> Result<(), Error> {
-        let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
-        our_ci.enc_pk = self.our_id;
+        let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
         trace!("Our requester CI: {:?}", our_ci);
 
         self.p2p_handle = Some(handle);
         self.our_ci = Some(our_ci.clone());
 
-        self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), our_ci))?;
+        self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), self.our_id, our_ci))?;
 
         Ok(())
     }
@@ -582,7 +573,7 @@ fn main() {
     }
 
     let mut client = Client::new(
-        our_pk.into_bytes(),
+        our_pk,
         our_name,
         svc,
         handle.clone(),

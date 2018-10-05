@@ -107,8 +107,8 @@ pub enum Error {
     Crust(CrustError),
     Unexpected(String),
     PartialPeerInfo,
-    WrongPeerPairing([u8; 32], [u8; 32]),
-    PeerNotFound([u8; 32]),
+    WrongPeerPairing(PublicEncryptKey, PublicEncryptKey),
+    PeerNotFound(PublicEncryptKey),
 }
 
 impl Display for Error {
@@ -150,8 +150,8 @@ pub struct LogEntry {
 #[derive(Debug)]
 enum Msg {
     NewPeer(Peer),
-    LostPeer([u8; 32]),
-    Message([u8; 32], Rpc),
+    LostPeer(PublicEncryptKey),
+    Message(PublicEncryptKey, Rpc),
 }
 
 #[derive(Eq, PartialEq, Hash, Debug)]
@@ -162,23 +162,23 @@ enum PeerStatus {
 
 struct Proxy {
     handle: Handle,
-    peers: HashMap<[u8; 32], ConnectedPeer>,
+    peers: HashMap<PublicEncryptKey, ConnectedPeer>,
     msg_tx: UnboundedSender<Msg>,
 }
 
 struct ConnectedPeer {
-    id: [u8; 32],
+    id: PublicEncryptKey,
     addr: PaAddr,
     conn_info: Option<RendezvousInfo>,
     nat: Option<NatType>,
     os: Option<Os>,
     name: Option<String>,
-    peers_known: HashMap<[u8; 32], PeerStatus>,
+    peers_known: HashMap<PublicEncryptKey, PeerStatus>,
     tx: UnboundedSender<Bytes>,
 }
 
 impl ConnectedPeer {
-    fn new(id: [u8; 32], addr: PaAddr, handle: Handle, sink: SplitSink<Peer>) -> Self {
+    fn new(id: PublicEncryptKey, addr: PaAddr, handle: Handle, sink: SplitSink<Peer>) -> Self {
         let (tx, rx) = mpsc::unbounded::<Bytes>();
         handle.spawn(sink.sink_map_err(|_| ()).send_all(rx).then(move |_| Ok(())));
 
@@ -215,7 +215,7 @@ impl Proxy {
         self.msg_tx.clone()
     }
 
-    fn lost_peer(&mut self, peer_key: [u8; 32]) -> Result<(), Error> {
+    fn lost_peer(&mut self, peer_key: PublicEncryptKey) -> Result<(), Error> {
         info!("Disconnected peer {:?}", peer_key);
 
         let _ = self.peers.remove(&peer_key);
@@ -238,7 +238,7 @@ impl Proxy {
     }
 
     fn new_peer(&mut self, peer: Peer) -> Result<(), Error> {
-        if self.peers.contains_key(&peer.public_id().into_bytes()) {
+        if self.peers.contains_key(&peer.public_id()) {
             warn!(
                 "Peer ID {} attempted to connect once again; dropping connection",
                 peer.public_id()
@@ -248,8 +248,8 @@ impl Proxy {
             return Ok(());
         }
 
-        let peer_key = peer.public_id().into_bytes();
-        let peer_key2 = peer.public_id().into_bytes();
+        let peer_key = peer.public_id().clone();
+        let peer_key2 = peer.public_id().clone();
 
         info!(
             "New peer! ID: {:?}, addr: {:?}",
@@ -293,8 +293,8 @@ impl Proxy {
     fn connect_with_match(
         &mut self,
         name: Option<String>,
-        requester_id: [u8; 32],
-        found_peer: Option<[u8; 32]>,
+        requester_id: PublicEncryptKey,
+        found_peer: Option<PublicEncryptKey>,
     ) -> Result<(), Error> {
         if let Some(new_pair) = found_peer {
             let conn_info = {
@@ -314,6 +314,7 @@ impl Proxy {
 
             peer.send_rpc(&Rpc::GetPeerReq(
                 if name.is_none() { requester_name } else { name },
+                requester_id,
                 conn_info,
             ))
         } else {
@@ -324,7 +325,7 @@ impl Proxy {
     }
 
     /// Finds a new random pairing peer for `peer_key` to connect to.
-    fn match_peer(&self, peer_key: [u8; 32]) -> Option<[u8; 32]> {
+    fn match_peer(&self, peer_key: PublicEncryptKey) -> Option<PublicEncryptKey> {
         let peer_self = unwrap!(self.get_peer(&peer_key));
 
         let mut peer_set: HashSet<_> = self.peers.keys().collect();
@@ -389,19 +390,19 @@ impl Proxy {
         stats::output_log(&log)
     }
 
-    fn get_peer(&self, peer_key: &[u8; 32]) -> Result<&ConnectedPeer, Error> {
+    fn get_peer(&self, peer_key: &PublicEncryptKey) -> Result<&ConnectedPeer, Error> {
         self.peers
             .get(peer_key)
             .ok_or_else(|| Error::PeerNotFound(peer_key.clone()))
     }
 
-    fn get_peer_mut(&mut self, peer_key: &[u8; 32]) -> Result<&mut ConnectedPeer, Error> {
+    fn get_peer_mut(&mut self, peer_key: &PublicEncryptKey) -> Result<&mut ConnectedPeer, Error> {
         self.peers
             .get_mut(peer_key)
             .ok_or_else(|| Error::PeerNotFound(peer_key.clone()))
     }
 
-    fn new_message(&mut self, peer_key: [u8; 32], rpc_cmd: Rpc) -> Result<(), Error> {
+    fn new_message(&mut self, peer_key: PublicEncryptKey, rpc_cmd: Rpc) -> Result<(), Error> {
         info!("got rpc {:?} from peer {:?}", rpc_cmd, peer_key);
 
         match rpc_cmd {
@@ -453,7 +454,7 @@ impl Proxy {
                     tcp_hole_punch_result: log.tcp_hole_punch_result,
                 })?;
             }
-            Rpc::GetPeerReq(name, conn) => {
+            Rpc::GetPeerReq(name, _public_id, conn) => {
                 self.get_peer_mut(&peer_key)?.conn_info = Some(conn);
                 let pair = self.match_peer(peer_key);
                 info!(
@@ -467,7 +468,7 @@ impl Proxy {
                 );
                 self.connect_with_match(name, peer_key, pair)?;
             }
-            Rpc::GetPeerResp(name, info) => {
+            Rpc::GetPeerResp(name, Some((_, connection_info))) => {
                 // Find pairing peer
                 let mut pair_peer_key = None;
                 for (peer, status) in &self.get_peer(&peer_key)?.peers_known {
@@ -489,10 +490,14 @@ impl Proxy {
                     pair_peer
                         .peers_known
                         .insert(peer_key, PeerStatus::Established);
-                    pair_peer.send_rpc(&Rpc::GetPeerResp(name, info))?;
+                    pair_peer
+                        .send_rpc(&Rpc::GetPeerResp(name, Some((peer_key, connection_info))))?;
                 } else {
                     error!("Not found matching peer");
                 }
+            }
+            _ => {
+                error!("Received invalid RPC from peer");
             }
         }
 
