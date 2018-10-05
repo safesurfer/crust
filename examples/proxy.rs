@@ -581,15 +581,15 @@ fn main() {
                     let no_hpin_udp_totals = no_hpin.udp_failures + no_hpin.udp_succ;
 
                     info!(
-                        "Stats: {:?}.\nSuccess percentages: TCP %: {}, UDP %: {}, HairpinTCP %: {}, HairpinUDP %: {}, TCP w/o Hairpinning %: {}, UDP w/o Hairpinning %: {}",
+                        "\nHole Punching Stats:\n{:#?}.\n\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\nTCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\nTCP (combined) %: {}, UDP (combined) %: {}\n",
                         STATS,
-                        if tcp_totals > 0 {
-                            ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
+                        if no_hpin_tcp_totals > 0 {
+                            ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
                         } else {
                             0.0
                         },
-                        if udp_totals > 0 {
-                            ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
+                        if no_hpin_udp_totals > 0 {
+                            ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
                         } else {
                             0.0
                         },
@@ -603,13 +603,13 @@ fn main() {
                         } else {
                             0.0
                         },
-                        if no_hpin_tcp_totals > 0 {
-                            ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
+                        if tcp_totals > 0 {
+                            ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
                         } else {
                             0.0
                         },
-                        if no_hpin_udp_totals > 0 {
-                            ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
+                        if udp_totals > 0 {
+                            ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
                         } else {
                             0.0
                         },

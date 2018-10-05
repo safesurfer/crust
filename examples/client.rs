@@ -215,42 +215,22 @@ impl Client {
             self.failed_conns.push(peer_id);
         }
 
-        info!(
-            "SuccessfulConns: {:?}",
-            self.successful_conns
-                .iter()
-                .map(|id| self.get_peer_name(*id))
-                .collect::<Vec<String>>()
-        );
-        info!(
-            "FailedConns: {:?}",
-            self.failed_conns
-                .iter()
-                .map(|id| self.get_peer_name(*id))
-                .collect::<Vec<String>>()
-        );
-        info!(
-            "AttemptedConns: {:?}",
-            self.attempted_conns
-                .iter()
-                .map(|id| self.get_peer_name(*id))
-                .collect::<Vec<String>>()
-        );
+        let mut log_output = String::new();
 
         // Connected to peer
-        info!(
-            "!!! {} with {} !!!",
+        log_output.push_str(&format!(
+            "\n===============================================\n{} with {}\n",
             if is_successful {
                 "Sucessfully connected"
             } else {
                 "Failed to connect"
             },
             self.get_peer_name(peer_id),
-        );
+        ));
 
         if let Ok(FullConnStats { ref tcp, .. }) = conn_res {
-            info!(
-                "TCP result: {}",
+            log_output.push_str(&format!(
+                "TCP result: {}\n",
                 if let Some(tcp) = tcp {
                     format!(
                         "{} (us) <-> {} (them)",
@@ -264,11 +244,11 @@ impl Client {
                 } else {
                     "Failed".to_owned()
                 }
-            );
+            ));
         }
         if let Ok(FullConnStats { ref udp, .. }) = conn_res {
-            info!(
-                "UDP result: {}",
+            log_output.push_str(&format!(
+                "UDP result: {}\n",
                 if let Some(udp) = udp {
                     format!(
                         "{} (us) <-> {} (them)",
@@ -282,13 +262,40 @@ impl Client {
                 } else {
                     "Failed".to_owned()
                 }
-            );
+            ));
         }
+
+        log_output.push_str(&format!(
+            "Successful connections: {:?}\n",
+            self.successful_conns
+                .iter()
+                .map(|id| self.get_peer_name(*id))
+                .collect::<Vec<String>>()
+        ));
+        log_output.push_str(&format!(
+            "Failed connections: {:?}\n",
+            self.failed_conns
+                .iter()
+                .map(|id| self.get_peer_name(*id))
+                .collect::<Vec<String>>()
+        ));
+        log_output.push_str(&format!(
+            "Attempted connections: {:?}\n",
+            self.attempted_conns
+                .iter()
+                .map(|id| self.get_peer_name(*id))
+                .collect::<Vec<String>>()
+        ));
+
+        log_output.push_str("===============================================");
+
+        info!("{}", log_output);
 
         // Send stats only if the requester is us
         if send_stats {
             let log_upd = self.aggregate_stats(peer_id, conn_res);
-            info!("Sending stats {:?}", log_upd);
+            info!("Sending stats");
+            trace!("{:?}", log_upd);
             self.send_rpc(&Rpc::UploadLog(log_upd))?;
         }
 
