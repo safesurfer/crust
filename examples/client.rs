@@ -22,6 +22,7 @@ extern crate rust_sodium;
 
 extern crate bytes;
 extern crate clap;
+extern crate config_file_handler;
 extern crate crust;
 extern crate future_utils;
 extern crate futures;

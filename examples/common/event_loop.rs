@@ -1,5 +1,6 @@
 #![allow(deprecated)]
 
+use config_file_handler;
 use mio::channel::{self, Sender};
 use mio::timer::{Timeout, Timer, TimerError};
 use mio::{Events, Poll, PollOpt, Ready, Token};
@@ -173,7 +174,12 @@ pub fn spawn_event_loop() -> El {
 
         let poll = unwrap!(Poll::new());
 
-        let mut file = unwrap!(File::open("./sample-config"));
+        let current_bin_dir = unwrap!(config_file_handler::current_bin_dir());
+
+        let mut file = unwrap!(File::open(format!(
+            "{}/sample-config",
+            unwrap!(current_bin_dir.as_path().to_str())
+        )));
         let mut content = String::new();
         unwrap!(file.read_to_string(&mut content));
         let config = unwrap!(serde_json::from_str(&content));
