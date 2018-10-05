@@ -67,6 +67,7 @@ use std::net::SocketAddr;
 use std::process;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio_core::reactor::{Core, Handle};
 use tokio_timer::Delay;
@@ -468,9 +469,14 @@ fn collect_conn_result(
     };
 
     let tcp = if let Some((tcp_stream, _tcp_token)) = tcp {
+        let peer_addr = unwrap!(tcp_stream.peer_addr());
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            drop(tcp_stream);
+        });
         Some(ConnStats {
             our: Some(unwrap!(our_ci.tcp)),
-            their: Some(unwrap!(tcp_stream.peer_addr())),
+            their: Some(peer_addr),
         })
     } else {
         None
