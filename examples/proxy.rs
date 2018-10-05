@@ -34,17 +34,47 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core;
+extern crate tokio_timer;
 #[macro_use]
 extern crate unwrap;
 
 // pub type PublicEncryptKey = [u8; 32];
+
+#[derive(Debug, Default)]
+struct StatPairs {
+    tcp_failures: u64,
+    tcp_succ: u64,
+    udp_failures: u64,
+    udp_succ: u64,
+}
+
+#[derive(Debug, Default)]
+struct QuickStats {
+    no_hairpin: StatPairs,
+    hairpin: StatPairs,
+}
+
+static mut STATS: QuickStats = QuickStats {
+    no_hairpin: StatPairs {
+        tcp_failures: 0,
+        tcp_succ: 0,
+        udp_failures: 0,
+        udp_succ: 0,
+    },
+    hairpin: StatPairs {
+        tcp_failures: 0,
+        tcp_succ: 0,
+        udp_failures: 0,
+        udp_succ: 0,
+    },
+};
 
 mod common;
 
 use bytes::Bytes;
 use clap::{App, Arg};
 use common::{NatTraversalResult, Os, Rpc};
-use crust::{ConfigFile, CrustError, CrustUser, NatType, PaAddr, Peer, PubConnectionInfo, Service};
+use crust::{ConfigFile, CrustError, CrustUser, NatType, PaAddr, Peer, Service};
 use futures::sync::mpsc::{self, UnboundedSender};
 use futures::{future::empty, stream::SplitSink, Future, Sink, Stream};
 use maidsafe_utilities::{
@@ -57,7 +87,9 @@ use safe_crypto::{PublicEncryptKey, SecretEncryptKey};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 use tokio_core::reactor::{Core, Handle};
+use tokio_timer::Interval;
 
 mod stats {
     use serde_json;
@@ -216,14 +248,15 @@ impl Proxy {
             return Ok(());
         }
 
+        let peer_key = peer.public_id().into_bytes();
+        let peer_key2 = peer.public_id().into_bytes();
+
         info!(
-            "New peer! ID: {}, addr: {:?}",
-            peer.public_id(),
+            "New peer! ID: {:?}, addr: {:?}",
+            peer_key,
             unwrap!(peer.addr())
         );
 
-        let peer_key = peer.public_id().into_bytes();
-        let peer_key2 = peer.public_id().into_bytes();
         let peer_addr = unwrap!(peer.addr());
 
         let (peer_sink, peer_stream) = peer.split();
@@ -321,6 +354,38 @@ impl Proxy {
     }
 
     fn add_log(&mut self, log: LogEntry) -> Result<(), Error> {
+        let is_hpin = log.peer_requester.ip == log.peer_responder.ip;
+
+        unsafe {
+            if let NatTraversalResult::Succeeded = log.udp_hole_punch_result {
+                if is_hpin {
+                    STATS.hairpin.udp_succ += 1;
+                } else {
+                    STATS.no_hairpin.udp_succ += 1;
+                }
+            } else {
+                if is_hpin {
+                    STATS.hairpin.udp_failures += 1;
+                } else {
+                    STATS.no_hairpin.udp_failures += 1;
+                }
+            }
+
+            if let NatTraversalResult::Succeeded = log.tcp_hole_punch_result {
+                if is_hpin {
+                    STATS.hairpin.tcp_succ += 1;
+                } else {
+                    STATS.no_hairpin.tcp_succ += 1;
+                }
+            } else {
+                if is_hpin {
+                    STATS.hairpin.tcp_failures += 1;
+                } else {
+                    STATS.no_hairpin.tcp_failures += 1;
+                }
+            }
+        }
+
         stats::output_log(&log)
     }
 
@@ -489,6 +554,65 @@ fn main() {
         }
         Ok(())
     }));
+
+    // Output stats every 30 seconds
+    handle.spawn(
+        Interval::new(Instant::now(), Duration::from_secs(30))
+            .for_each(move |_| {
+                unsafe {
+                    let no_hpin = &STATS.no_hairpin;
+                    let hpin = &STATS.hairpin;
+
+                    let tcp_totals = hpin.tcp_failures + hpin.tcp_succ + no_hpin.tcp_failures + no_hpin.tcp_succ;
+                    let tcp_totals_succ = hpin.tcp_succ + no_hpin.tcp_succ;
+
+                    let udp_totals = hpin.udp_failures + hpin.udp_succ + no_hpin.udp_failures + no_hpin.udp_succ;
+                    let udp_totals_succ = hpin.udp_succ + no_hpin.udp_succ;
+
+                    let hpin_tcp_totals = hpin.tcp_failures + hpin.tcp_succ;
+                    let hpin_udp_totals = hpin.udp_failures + hpin.udp_succ;
+
+                    let no_hpin_tcp_totals = no_hpin.tcp_failures + no_hpin.tcp_succ;
+                    let no_hpin_udp_totals = no_hpin.udp_failures + no_hpin.udp_succ;
+
+                    info!(
+                        "Stats: {:?}.\nSuccess percentages: TCP %: {}, UDP %: {}, HairpinTCP %: {}, HairpinUDP %: {}, TCP w/o Hairpinning %: {}, UDP w/o Hairpinning %: {}",
+                        STATS,
+                        if tcp_totals > 0 {
+                            ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                        if udp_totals > 0 {
+                            ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                        if hpin_tcp_totals > 0 {
+                            ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                        if hpin_udp_totals > 0 {
+                            ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                        if no_hpin_tcp_totals > 0 {
+                            ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                        if no_hpin_udp_totals > 0 {
+                            ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
+                        } else {
+                            0.0
+                        },
+                    );
+                }
+                Ok(())
+            }).then(move |_| Ok(())),
+    );
 
     // Setup bootstrap proxy
     let handle2 = handle.clone();

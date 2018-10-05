@@ -173,6 +173,7 @@ struct Client {
     attempted_conns: Vec<PublicEncryptKey>,
     failed_conns: Vec<PublicEncryptKey>,
     connecting_to: Option<PublicEncryptKey>,
+    our_id: PublicEncryptKey,
     our_ci: Option<RendezvousInfo>,
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
@@ -182,6 +183,7 @@ struct Client {
 
 impl Client {
     fn new(
+        our_id: PublicEncryptKey,
         name: Option<String>,
         service: Service,
         handle: Handle,
@@ -190,6 +192,7 @@ impl Client {
         p2p_el: El,
     ) -> Self {
         Client {
+            our_id,
             handle,
             proxy_tx,
             client_tx,
@@ -475,7 +478,8 @@ impl Client {
                 let client_tx = self.client_tx.clone();;
                 let name = self.name.clone();
 
-                let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+                let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+                our_ci.enc_pk = self.our_id;
                 info!("Our responder CI: {:?}", our_ci);
 
                 let our_ci2 = our_ci.clone();
@@ -504,7 +508,8 @@ impl Client {
     }
 
     fn await_peer(&mut self) -> Result<(), Error> {
-        let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+        let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+        our_ci.enc_pk = self.our_id;
         info!("Our requester CI: {:?}", our_ci);
 
         self.p2p_handle = Some(handle);
@@ -604,6 +609,7 @@ fn main() {
     }
 
     let mut client = Client::new(
+        our_pk.into_bytes(),
         our_name,
         svc,
         handle.clone(),
