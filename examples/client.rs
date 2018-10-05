@@ -54,21 +54,20 @@ use maidsafe_utilities::{
     log as logger,
     serialisation::{deserialise, serialise, SerialisationError},
 };
-use mio::{Poll, PollOpt, Ready, Token};
+use mio::Poll;
 use p2p_old::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
-    RendezvousInfo, Res, Socket as TcpSocket,
+    RendezvousInfo, Res,
 };
-use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, BufRead, ErrorKind, Write};
+use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
+use std::process;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
-use std::{process, thread};
 use tokio_core::reactor::{Core, Handle};
 use tokio_timer::Delay;
 
@@ -120,12 +119,7 @@ enum Msg {
     Incoming(Rpc),
     RetryConnect,
     Terminate,
-    ConnectedWithPeer(
-        RendezvousInfo,
-        PublicEncryptKey,
-        Result<HolePunchInfo, NatError>,
-        bool,
-    ),
+    ConnectedWithPeer(PublicEncryptKey, Result<FullConnStats, ()>, bool),
 }
 
 /// Detects OS type
@@ -207,68 +201,6 @@ impl Client {
             our_ci: None,
             p2p_el,
         }
-    }
-
-    fn connected_with_peer(
-        &mut self,
-        our_ci: RendezvousInfo,
-        peer_id: PublicEncryptKey,
-        conn_res: Result<HolePunchInfo, NatError>,
-        is_requester: bool,
-    ) -> Result<(), Error> {
-        let HolePunchInfo { tcp, udp, .. } = match conn_res {
-            Ok(conn_info) => conn_info,
-            Err(_e) => {
-                // could not traverse nat type
-                self.report_connection_result(peer_id, Err(()), is_requester)?;
-                return Ok(());
-            }
-        };
-
-        let (tcp_sock, tcp_token) = if let Some((tcp_stream, tcp_token)) = tcp {
-            (Some(TcpSocket::wrap(tcp_stream)), tcp_token)
-        } else {
-            (None, Token(0))
-        };
-
-        let (udp_sock, udp_peer, udp_our_ext_addr, udp_token) =
-            if let Some((udp_sock, udp_peer, udp_our_ext_addr, udp_token)) = udp {
-                (
-                    Some(udp_sock),
-                    Some(udp_peer),
-                    Some(udp_our_ext_addr),
-                    udp_token,
-                )
-            } else {
-                (None, None, None, Token(0))
-            };
-
-        let tx = self.p2p_el.core_tx.clone();
-        let msg_tx = self.client_tx.clone();
-
-        // Collect conn info
-        let tcp = if let Some(ref tcp) = tcp_sock {
-            Some(ConnStats {
-                our: Some(unwrap!(our_ci.tcp)),
-                their: Some(unwrap!(tcp.peer_addr())),
-            })
-        } else {
-            None
-        };
-        let udp = if let Some(ref udp) = udp_sock {
-            Some(ConnStats {
-                our: udp_our_ext_addr,
-                their: udp_peer,
-            })
-        } else {
-            None
-        };
-
-        let full_conn_stats = FullConnStats { tcp, udp };
-
-        self.report_connection_result(peer_id, Ok(full_conn_stats), is_requester);
-
-        Ok(())
     }
 
     fn report_connection_result(
@@ -444,12 +376,13 @@ impl Client {
                         ci,
                         Box::new(move |_, _, res| {
                             // Hole punch success
-                            unwrap!(client_tx.unbounded_send(Msg::ConnectedWithPeer(
-                                our_ci.clone(),
-                                id,
-                                res,
-                                true
-                            )));
+                            let full_stats = collect_conn_result(&our_ci, res);
+
+                            unwrap!(
+                                client_tx
+                                    .unbounded_send(Msg::ConnectedWithPeer(id, full_stats, true))
+                            );
+
                             unwrap!(client_tx.unbounded_send(Msg::RetryConnect));
                         }),
                     );
@@ -480,7 +413,7 @@ impl Client {
 
                 let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
                 our_ci.enc_pk = self.our_id;
-                info!("Our responder CI: {:?}", our_ci);
+                trace!("Our responder CI: {:?}", our_ci);
 
                 let our_ci2 = our_ci.clone();
 
@@ -488,12 +421,13 @@ impl Client {
                     theirs_ci,
                     Box::new(move |_, _, res| {
                         // Hole punch success
-                        unwrap!(client_tx.unbounded_send(Msg::ConnectedWithPeer(
-                            our_ci2.clone(),
-                            theirs_id,
-                            res,
-                            false
-                        )));
+                        let full_stats = collect_conn_result(&our_ci2, res);
+
+                        unwrap!(
+                            client_tx.unbounded_send(Msg::ConnectedWithPeer(
+                                theirs_id, full_stats, false
+                            ))
+                        );
                     }),
                 );
 
@@ -510,7 +444,7 @@ impl Client {
     fn await_peer(&mut self) -> Result<(), Error> {
         let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
         our_ci.enc_pk = self.our_id;
-        info!("Our requester CI: {:?}", our_ci);
+        trace!("Our requester CI: {:?}", our_ci);
 
         self.p2p_handle = Some(handle);
         self.our_ci = Some(our_ci.clone());
@@ -519,6 +453,39 @@ impl Client {
 
         Ok(())
     }
+}
+
+fn collect_conn_result(
+    our_ci: &RendezvousInfo,
+    conn_res: Result<HolePunchInfo, NatError>,
+) -> Result<FullConnStats, ()> {
+    let HolePunchInfo { tcp, udp, .. } = match conn_res {
+        Ok(conn_info) => conn_info,
+        Err(_e) => {
+            // could not traverse nat type
+            return Err(());
+        }
+    };
+
+    let tcp = if let Some((tcp_stream, _tcp_token)) = tcp {
+        Some(ConnStats {
+            our: Some(unwrap!(our_ci.tcp)),
+            their: Some(unwrap!(tcp_stream.peer_addr())),
+        })
+    } else {
+        None
+    };
+
+    let udp = if let Some((_udp_sock, udp_peer, udp_our_ext_addr, _udp_token)) = udp {
+        Some(ConnStats {
+            our: Some(udp_our_ext_addr),
+            their: Some(udp_peer),
+        })
+    } else {
+        None
+    };
+
+    Ok(FullConnStats { tcp, udp })
 }
 
 fn get_user_name() -> Option<String> {
@@ -655,8 +622,8 @@ fn main() {
                     // Msg::ConnectionInfo(ci, chan) => client.set_new_conn_info(ci, chan),
                     Msg::Incoming(rpc) => client.handle_new_message(rpc),
                     Msg::RetryConnect => client.await_peer(),
-                    Msg::ConnectedWithPeer(our_ci, peer_id, peer, send_stats) => {
-                        client.connected_with_peer(our_ci, peer_id, peer, send_stats)
+                    Msg::ConnectedWithPeer(peer_id, full_stats, send_stats) => {
+                        client.report_connection_result(peer_id, full_stats, send_stats)
                     }
                     Msg::Terminate => process::exit(0),
                 };
