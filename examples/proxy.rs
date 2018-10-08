@@ -73,7 +73,7 @@ mod common;
 use bytes::Bytes;
 use clap::{App, Arg};
 use common::{NatTraversalResult, Os, Rpc};
-use crust::{ConfigFile, CrustError, CrustUser, NatType, PaAddr, Peer, Service};
+use crust::{ConfigFile, CrustError, CrustUser, NatType, PaAddr, Peer, PeerError, Service};
 use futures::sync::mpsc::{self, UnboundedSender};
 use futures::{future::empty, stream::SplitSink, Future, Sink, Stream};
 use maidsafe_utilities::{
@@ -85,6 +85,8 @@ use rand::Rng;
 use safe_crypto::{PublicEncryptKey, SecretEncryptKey};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio_core::reactor::{Core, Handle};
@@ -127,6 +129,12 @@ impl From<serde_json::Error> for Error {
 impl From<CrustError> for Error {
     fn from(err: CrustError) -> Self {
         Error::Crust(err)
+    }
+}
+
+impl From<PeerError> for Error {
+    fn from(err: PeerError) -> Self {
+        Error::Unexpected(format!("{}", err))
     }
 }
 
@@ -250,13 +258,9 @@ impl Proxy {
         let peer_key = peer.public_id().clone();
         let peer_key2 = peer.public_id().clone();
 
-        info!(
-            "New peer! ID: {}, addr: {:?}",
-            peer_key,
-            unwrap!(peer.addr())
-        );
+        let peer_addr = peer.addr()?;
 
-        let peer_addr = unwrap!(peer.addr());
+        info!("New peer! ID: {}, addr: {:?}", peer_key, peer_addr);
 
         let (peer_sink, peer_stream) = peer.split();
 
@@ -324,8 +328,11 @@ impl Proxy {
 
     /// Finds a new random pairing peer for `peer_key` to connect to.
     fn match_peer(&self, peer_key: PublicEncryptKey) -> Option<PublicEncryptKey> {
-        let peer_self = unwrap!(self.get_peer(&peer_key));
-
+        let peer_self = if let Ok(peer_self) = self.get_peer(&peer_key) {
+            peer_self
+        } else {
+            return None;
+        };
         let mut peer_set: HashSet<_> = self.peers.keys().collect();
         peer_set.remove(&peer_key); // remove self from the randomised selection process
 
@@ -342,8 +349,11 @@ impl Proxy {
             .difference(&known_peers)
             // filter out peers that don't have connection info
             .filter(|peer| {
-                let p = unwrap!(self.peers.get(**peer));
-                p.conn_info.is_some() && p.nat.is_some()
+                if let Some(p) = self.peers.get(**peer) {
+                    p.conn_info.is_some() && p.nat.is_some()
+                } else {
+                    false
+                }
             })
             .collect::<Vec<_>>();
 
@@ -510,6 +520,23 @@ impl Proxy {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Config {
+    secret_key: [u8; 32],
+    public_key: [u8; 32],
+}
+
+fn read_proxy_config() -> Config {
+    let current_bin_dir = unwrap!(config_file_handler::current_bin_dir());
+    let mut file = unwrap!(File::open(format!(
+        "{}/proxy-config",
+        unwrap!(current_bin_dir.as_path().to_str())
+    )));
+    let mut content = String::new();
+    unwrap!(file.read_to_string(&mut content));
+    unwrap!(serde_json::from_str(&content))
+}
+
 fn main() {
     unwrap!(logger::init(true));
 
@@ -534,14 +561,10 @@ fn main() {
     let mut event_loop = unwrap!(Core::new());
     let handle = event_loop.handle();
 
-    let our_pk = PublicEncryptKey::from_bytes([
-        136, 225, 216, 0, 112, 223, 59, 247, 97, 60, 231, 203, 1, 155, 95, 99, 197, 221, 127, 206,
-        181, 223, 155, 113, 142, 180, 211, 80, 144, 71, 244, 104,
-    ]);
-    let our_sk = SecretEncryptKey::from_bytes([
-        167, 64, 194, 202, 108, 93, 240, 47, 241, 95, 23, 16, 180, 204, 223, 174, 161, 1, 156, 102,
-        20, 212, 115, 170, 221, 177, 205, 150, 111, 161, 119, 43,
-    ]);
+    let proxy_config = read_proxy_config();
+
+    let our_pk = PublicEncryptKey::from_bytes(proxy_config.public_key);
+    let our_sk = SecretEncryptKey::from_bytes(proxy_config.secret_key);
 
     info!("Our public key is {:?}", our_pk);
 
