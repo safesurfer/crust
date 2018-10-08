@@ -22,20 +22,19 @@ use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 // With custom Eq/PartialEq implemented to discard `NatTraversalResult::time_spent` as we don't want to account for that in HashSet dedups
 #[derive(Serialize, Deserialize, Debug)]
 pub enum NatTraversalResult {
     Failed,
-    Succeeded { time_spent: Duration },
+    Succeeded,
 }
 
 impl PartialEq for NatTraversalResult {
     fn eq(&self, other: &NatTraversalResult) -> bool {
         match (self, other) {
             (NatTraversalResult::Failed, NatTraversalResult::Failed) => true,
-            (NatTraversalResult::Succeeded { .. }, NatTraversalResult::Succeeded { .. }) => true,
+            (NatTraversalResult::Succeeded, NatTraversalResult::Succeeded) => true,
             _ => false,
         }
     }
@@ -47,7 +46,7 @@ impl Hash for NatTraversalResult {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             NatTraversalResult::Failed => 0.hash(state),
-            NatTraversalResult::Succeeded { .. } => 1.hash(state),
+            NatTraversalResult::Succeeded => 1.hash(state),
         }
     }
 }

@@ -17,7 +17,7 @@ futures = "~0.1.17"
 get_if_addrs = "~0.4.0"
 log = "~0.3.8"
 lru_time_cache = "~0.8.0"
-maidsafe_utilities = "~0.16.0"
+maidsafe_utilities = { git = "https://github.com/maidsafe/maidsafe_utilities.git", rev = "60b8e2a" }
 maplit = "~1.0.1"
 net-literals = "~0.1"
 net2 = "~0.2.31"

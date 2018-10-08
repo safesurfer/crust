@@ -62,9 +62,7 @@ impl Rand for NatTraversalResult {
         if failed {
             NatTraversalResult::Failed
         } else {
-            NatTraversalResult::Succeeded {
-                time_spent: Duration::from_millis(rng.gen_range(50, 1000)),
-            }
+            NatTraversalResult::Succeeded
         }
     }
 }
