@@ -39,8 +39,6 @@ extern crate tokio_timer;
 #[macro_use]
 extern crate unwrap;
 
-// pub type PublicEncryptKey = [u8; 32];
-
 #[derive(Debug, Default)]
 struct StatPairs {
     tcp_failures: u64,
@@ -158,7 +156,7 @@ enum Msg {
 #[derive(Eq, PartialEq, Hash, Debug)]
 enum PeerStatus {
     Pending,
-    Established, // FIXME: rename
+    Matched,
 }
 
 struct Proxy {
@@ -217,20 +215,20 @@ impl Proxy {
     }
 
     fn lost_peer(&mut self, peer_key: PublicEncryptKey) -> Result<(), Error> {
-        info!("Disconnected peer {:?}", peer_key);
+        info!("Disconnected peer {}", self.peer_name(&peer_key)?);
 
         let _ = self.peers.remove(&peer_key);
-        let mut needs_new_pair = None;
+        let mut need_new_pair = Vec::new();
 
         for peer in self.peers.values_mut() {
             let status = peer.peers_known.remove(&peer_key);
             if let Some(PeerStatus::Pending) = status {
-                needs_new_pair = Some(peer.id);
+                need_new_pair.push(peer.id);
             }
         }
 
         // Find a new pair for a peer that was lost due to a connection
-        if let Some(peer_key) = needs_new_pair {
+        for peer_key in need_new_pair {
             let pair = self.match_peer(peer_key);
             self.connect_with_match(None, peer_key, pair)?;
         }
@@ -253,7 +251,7 @@ impl Proxy {
         let peer_key2 = peer.public_id().clone();
 
         info!(
-            "New peer! ID: {:?}, addr: {:?}",
+            "New peer! ID: {}, addr: {:?}",
             peer_key,
             unwrap!(peer.addr())
         );
@@ -310,8 +308,7 @@ impl Proxy {
             let requester_name = { self.get_peer(&requester_id)?.name.clone() };
 
             let peer = self.get_peer_mut(&new_pair)?;
-            peer.peers_known
-                .insert(requester_id, PeerStatus::Established);
+            peer.peers_known.insert(requester_id, PeerStatus::Matched);
 
             peer.send_rpc(&Rpc::GetPeerReq(
                 if name.is_none() { requester_name } else { name },
@@ -334,11 +331,11 @@ impl Proxy {
 
         let known_peers: HashSet<_> = peer_self.peers_known.keys().collect();
         info!(
-            "{:?} already knows about {:?}",
+            "{} already knows about {:?}",
             peer_key,
             known_peers
                 .iter()
-                .map(|id| format!("{:?}", id))
+                .map(|id| format!("{}", id))
                 .collect::<Vec<String>>()
         );
         let unknown_peers = peer_set
@@ -403,8 +400,17 @@ impl Proxy {
             .ok_or_else(|| Error::PeerNotFound(peer_key.clone()))
     }
 
+    fn peer_name(&self, peer_key: &PublicEncryptKey) -> Result<String, Error> {
+        Ok(self.get_peer(peer_key).map(|p| {
+            p.name
+                .clone()
+                .map(|name| format!("{} ({})", name, peer_key))
+                .unwrap_or_else(|| format!("{}", peer_key))
+        })?)
+    }
+
     fn new_message(&mut self, peer_key: PublicEncryptKey, rpc_cmd: Rpc) -> Result<(), Error> {
-        info!("got rpc {:?} from peer {:?}", rpc_cmd, peer_key);
+        trace!("RPC from {}: {:?}", self.peer_name(&peer_key)?, rpc_cmd);
 
         match rpc_cmd {
             Rpc::UpdateDetails { name, nat, os } => {
@@ -459,10 +465,10 @@ impl Proxy {
                 self.get_peer_mut(&peer_key)?.conn_info = Some(conn);
                 let pair = self.match_peer(peer_key);
                 info!(
-                    "Matching {:?} with {}",
+                    "Matching {} with {}",
                     peer_key,
                     if let Some(pk) = pair {
-                        format!("{:?}", pk)
+                        self.peer_name(&pk)?
                     } else {
                         "no one".to_string()
                     }
@@ -473,7 +479,7 @@ impl Proxy {
                 // Find pairing peer
                 let mut pair_peer_key = None;
                 for (peer, status) in &self.get_peer(&peer_key)?.peers_known {
-                    info!("known {:?} / {:?}", peer, status);
+                    info!("known {} / {:?}", self.peer_name(peer)?, status);
 
                     if self.get_peer(&peer)?.peers_known.get(&peer_key)
                         == Some(&PeerStatus::Pending)
@@ -485,12 +491,10 @@ impl Proxy {
                 }
 
                 if let Some(pair_peer_key) = pair_peer_key {
-                    info!("Connecting with {:?}", pair_peer_key);
+                    info!("Connecting with {}", self.peer_name(&pair_peer_key)?);
 
                     let pair_peer = self.get_peer_mut(&pair_peer_key)?;
-                    pair_peer
-                        .peers_known
-                        .insert(peer_key, PeerStatus::Established);
+                    pair_peer.peers_known.insert(peer_key, PeerStatus::Matched);
                     pair_peer
                         .send_rpc(&Rpc::GetPeerResp(name, Some((peer_key, connection_info))))?;
                 } else {

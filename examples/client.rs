@@ -305,7 +305,6 @@ impl Client {
 
     fn probe_nat(&self, el: &mut Core) -> Result<(), Error> {
         let nat_type = unwrap!(el.run(self.service.borrow().probe_nat()));
-        // let nat_type = NatType::Unknown;
         let os_type = detect_os();
         info!("Detected NAT type {:?}", nat_type);
         info!("Detected OS type: {:?}", os_type);
@@ -533,10 +532,6 @@ fn main() {
                 .short("c")
                 .takes_value(true)
                 .help("Config file path"),
-        ).arg(
-            Arg::with_name("prevent_direct")
-                .long("prevent-direct-connections")
-                .help("Prevents direct connections requiring the other side to hole punch"),
         ).get_matches();
 
     let our_name = get_user_name();
@@ -573,12 +568,6 @@ fn main() {
     let (client_tx, client_rx) = mpsc::unbounded();
     let client_tx2 = client_tx.clone();
     let client_tx3 = client_tx.clone();
-
-    // Setup listeners
-    let listeners = unwrap!(event_loop.run(svc.start_listening().collect()));
-    for listener in &listeners {
-        info!("Listening on {}", listener.addr());
-    }
 
     let mut client = Client::new(
         our_pk,
@@ -624,7 +613,6 @@ fn main() {
         client_rx
             .for_each(move |msg| {
                 let res = match msg {
-                    // Msg::ConnectionInfo(ci, chan) => client.set_new_conn_info(ci, chan),
                     Msg::Incoming(rpc) => client.handle_new_message(rpc),
                     Msg::RetryConnect => client.await_peer(),
                     Msg::ConnectedWithPeer(peer_id, full_stats, send_stats) => {
