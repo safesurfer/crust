@@ -587,11 +587,7 @@ fn main() {
     let proxy = match event_loop.run(svc.bootstrap(Default::default(), false, CrustUser::Client)) {
         Ok(proxy) => proxy,
         Err(e) => {
-            error!("\n\nCould not connect with the proxy: {}\n\nThis probably means that your IP address is not registered. Please follow this link for registration: http://crustnet.maidsafe.net/\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.", e);
-
-            println!("Press any key to continue...");
-
-            unwrap!(io::stdout().flush());
+            error!("\n\nCould not connect with the proxy: {}\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crustnet.maidsafe.net/\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress any key to continue...", e);
 
             let stdin = io::stdin();
             let mut readline = String::new();
