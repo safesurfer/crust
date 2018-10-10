@@ -584,8 +584,23 @@ fn main() {
     info!("Our public ID: {}", our_pk);
 
     info!("Attempting bootstrap...");
-    let proxy =
-        unwrap!(event_loop.run(svc.bootstrap(Default::default(), false, CrustUser::Client)));
+    let proxy = match event_loop.run(svc.bootstrap(Default::default(), false, CrustUser::Client)) {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            error!("\n\nCould not connect with the proxy: {}\n\nThis probably means that your IP address is not registered. Please follow this link for registration: http://crustnet.maidsafe.net/\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.", e);
+
+            println!("Press any key to continue...");
+
+            unwrap!(io::stdout().flush());
+
+            let stdin = io::stdin();
+            let mut readline = String::new();
+            unwrap!(stdin.lock().read_line(&mut readline));
+
+            panic!("Aborting due to the previous error");
+        }
+    };
+
     info!(
         "Connected to {}, {}",
         proxy.public_id(),
