@@ -48,7 +48,7 @@ rev = "595fa57"
 
 [dependencies.p2p_old]
 git = "https://github.com/nbaksalyar/p2p"
-rev = "c2d0874"
+rev = "52669a7"
 
 [dependencies.tokio-utp]
 git = "https://github.com/maidsafe/tokio_utp"

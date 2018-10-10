@@ -173,6 +173,7 @@ struct Client {
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
     p2p_el: El,
+    display_available_peers: bool,
 }
 
 impl Client {
@@ -199,6 +200,7 @@ impl Client {
             failed_conns: Vec::new(),
             our_ci: None,
             p2p_el,
+            display_available_peers: true,
         }
     }
 
@@ -208,6 +210,8 @@ impl Client {
         conn_res: Result<FullConnStats, ()>,
         send_stats: bool,
     ) -> Result<(), Error> {
+        self.display_available_peers = true;
+
         let is_successful = conn_res.is_ok();
 
         if is_successful {
@@ -295,7 +299,7 @@ impl Client {
         // Send stats only if the requester is us
         if send_stats {
             let log_upd = self.aggregate_stats(peer_id, conn_res);
-            info!("Sending stats");
+            trace!("Sending stats");
             trace!("{:?}", log_upd);
             self.send_rpc(&Rpc::UploadLog(log_upd))?;
         }
@@ -304,7 +308,13 @@ impl Client {
     }
 
     fn probe_nat(&self, el: &mut Core) -> Result<(), Error> {
-        let nat_type = unwrap!(el.run(self.service.borrow().probe_nat()));
+        let nat_type = match el.run(self.service.borrow().probe_nat()) {
+            Ok(nat_type) => nat_type,
+            Err(e) => {
+                error!("Could not detect the NAT type: {}", e);
+                panic!("Aborting due to the previous error");
+            }
+        };
         let os_type = detect_os();
         info!("Detected NAT type {:?}", nat_type);
         info!("Detected OS type: {:?}", os_type);
@@ -342,7 +352,7 @@ impl Client {
     }
 
     fn send_rpc(&self, rpc: &Rpc) -> Result<(), Error> {
-        info!("Sending {}", rpc);
+        trace!("Sending {}", rpc);
         let bytes = serialise(&rpc)?;
         self.proxy_tx.unbounded_send(Bytes::from(bytes))?;
         Ok(())
@@ -357,7 +367,7 @@ impl Client {
     }
 
     fn handle_new_message(&mut self, rpc_cmd: Rpc) -> Result<(), Error> {
-        info!("Received {}", rpc_cmd);
+        trace!("Received {}", rpc_cmd);
 
         match rpc_cmd {
             Rpc::GetPeerResp(name, ci_opt) => {
@@ -390,10 +400,14 @@ impl Client {
                     );
                 } else {
                     // Retry again in some time
-                    info!(
-                        "All available peers have been attempted to be reached. Checking for new peers in {} seconds",
-                        RETRY_DELAY
-                    );
+                    if self.display_available_peers {
+                        info!(
+                            "\n\nAll available peers have been attempted to be reached. Checking for new peers every {} seconds.",
+                            RETRY_DELAY
+                        );
+                        self.display_available_peers = false;
+                    }
+
                     retry_connection(&self.handle, &self.client_tx);
                 }
             }
@@ -412,7 +426,13 @@ impl Client {
                 let client_tx = self.client_tx.clone();;
                 let name = self.name.clone();
 
-                let (handle, mut our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+                let (handle, mut our_ci) = match get_rendezvous_info(&self.p2p_el) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Failed to get our connection info: {}", e);
+                        panic!("Aborting due to the previous error");
+                    }
+                };
                 trace!("Our responder CI: {:?}", our_ci);
 
                 let our_ci2 = our_ci.clone();
@@ -467,15 +487,25 @@ fn collect_conn_result(
     };
 
     let tcp = if let Some((tcp_stream, _tcp_token)) = tcp {
-        let peer_addr = unwrap!(tcp_stream.peer_addr());
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(3));
-            drop(tcp_stream);
-        });
-        Some(ConnStats {
-            our: Some(unwrap!(our_ci.tcp)),
-            their: Some(peer_addr),
-        })
+        let peer_addr = match tcp_stream.peer_addr() {
+            Ok(pa) => Some(pa),
+            Err(e) => {
+                debug!("Failed to get TCP peer address: {}", e);
+                None
+            }
+        };
+        if let Some(peer_addr) = peer_addr {
+            thread::spawn(move || {
+                thread::sleep(Duration::from_secs(5));
+                drop(tcp_stream);
+            });
+            Some(ConnStats {
+                our: Some(unwrap!(our_ci.tcp)),
+                their: Some(peer_addr),
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
