@@ -28,8 +28,7 @@ use std::time::Duration;
 pub struct LogEntry {
     peer_requester: Peer,
     peer_responder: Peer,
-    is_direct_successful: bool,
-    utp_hole_punch_result: NatTraversalResult,
+    udp_hole_punch_result: NatTraversalResult,
     tcp_hole_punch_result: NatTraversalResult,
 }
 
@@ -82,10 +81,9 @@ fn main() {
 
     loop {
         stats::output_log(&LogEntry {
-            is_direct_successful: rand::random(),
             peer_requester: rand::random(),
             peer_responder: rand::random(),
-            utp_hole_punch_result: rand::random(),
+            udp_hole_punch_result: rand::random(),
             tcp_hole_punch_result: rand::random(),
         });
         thread::sleep(Duration::from_secs(3));
