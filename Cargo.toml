@@ -31,9 +31,19 @@ get_if_addrs = "~0.4.1"
 [dev-dependencies]
 clap = "~2.25.1"
 p2p = { path = "../p2p" }
-safe_crypto = "*"
+safe_crypto = "~0.5.0"
 
-# [[example]]
-# bench = false
-# name = "crust_peer"
-# path = "examples/crust_peer.rs"
+[[example]]
+bench = false
+name = "crust_peer"
+path = "examples/crust_peer.rs"
+
+[[example]]
+bench = false
+name = "proxy"
+path = "examples/proxy.rs"
+
+[[example]]
+bench = false
+name = "client"
+path = "examples/client.rs"

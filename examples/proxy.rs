@@ -33,6 +33,30 @@ extern crate serde_json;
 #[macro_use]
 extern crate unwrap;
 
+mod common;
+
+use clap::{App, Arg};
+use common::{Id, NatTraversalResult, Os, Rpc};
+use crust::*;
+use maidsafe_utilities::{
+    event_sender::{MaidSafeEventCategory, MaidSafeObserver},
+    log as logger,
+    serialisation::{deserialise, serialise},
+};
+use p2p::{NatType, RendezvousInfo};
+use rand::Rng;
+use safe_crypto::PublicEncryptKey;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Display, Formatter};
+use std::fs::File;
+use std::io::Read;
+use std::net::IpAddr;
+use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
 #[derive(Debug, Default)]
 struct StatPairs {
     tcp_failures: u64,
@@ -46,45 +70,6 @@ struct QuickStats {
     no_hairpin: StatPairs,
     hairpin: StatPairs,
 }
-
-static mut STATS: QuickStats = QuickStats {
-    no_hairpin: StatPairs {
-        tcp_failures: 0,
-        tcp_succ: 0,
-        udp_failures: 0,
-        udp_succ: 0,
-    },
-    hairpin: StatPairs {
-        tcp_failures: 0,
-        tcp_succ: 0,
-        udp_failures: 0,
-        udp_succ: 0,
-    },
-};
-
-mod common;
-
-use clap::{App, Arg};
-use common::{Id, NatTraversalResult, Os, Rpc};
-use crust::*;
-use maidsafe_utilities::{
-    event_sender::{MaidSafeEventCategory, MaidSafeObserver},
-    log as logger,
-    serialisation::{deserialise, serialise},
-};
-use p2p::{NatType, RendezvousInfo};
-use rand::Rng;
-use safe_crypto::{PublicEncryptKey, SecretEncryptKey};
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Display, Formatter};
-use std::fs::File;
-use std::io::Read;
-use std::net::IpAddr;
-use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 mod stats {
     use serde_json;
@@ -181,12 +166,14 @@ impl ConnectedPeer {
 struct Proxy {
     peers: HashMap<PublicEncryptKey, ConnectedPeer>,
     service: Rc<RefCell<Service<Id>>>,
+    stats_mutex: Arc<Mutex<QuickStats>>,
 }
 
 impl Proxy {
-    fn new(service: Rc<RefCell<Service<Id>>>) -> Self {
+    fn new(service: Rc<RefCell<Service<Id>>>, stats_mutex: Arc<Mutex<QuickStats>>) -> Self {
         Proxy {
             service,
+            stats_mutex,
             peers: Default::default(),
         }
     }
@@ -322,32 +309,34 @@ impl Proxy {
     fn add_log(&mut self, log: LogEntry) -> Result<(), Error> {
         let is_hpin = log.peer_requester.ip == log.peer_responder.ip;
 
-        unsafe {
+        {
+            let mut stats = unwrap!(self.stats_mutex.lock());
+
             if let NatTraversalResult::Succeeded = log.udp_hole_punch_result {
                 if is_hpin {
-                    STATS.hairpin.udp_succ += 1;
+                    stats.hairpin.udp_succ += 1;
                 } else {
-                    STATS.no_hairpin.udp_succ += 1;
+                    stats.no_hairpin.udp_succ += 1;
                 }
             } else {
                 if is_hpin {
-                    STATS.hairpin.udp_failures += 1;
+                    stats.hairpin.udp_failures += 1;
                 } else {
-                    STATS.no_hairpin.udp_failures += 1;
+                    stats.no_hairpin.udp_failures += 1;
                 }
             }
 
             if let NatTraversalResult::Succeeded = log.tcp_hole_punch_result {
                 if is_hpin {
-                    STATS.hairpin.tcp_succ += 1;
+                    stats.hairpin.tcp_succ += 1;
                 } else {
-                    STATS.no_hairpin.tcp_succ += 1;
+                    stats.no_hairpin.tcp_succ += 1;
                 }
             } else {
                 if is_hpin {
-                    STATS.hairpin.tcp_failures += 1;
+                    stats.hairpin.tcp_failures += 1;
                 } else {
-                    STATS.no_hairpin.tcp_failures += 1;
+                    stats.no_hairpin.tcp_failures += 1;
                 }
             }
         }
@@ -504,58 +493,13 @@ fn read_proxy_config() -> Config {
     unwrap!(serde_json::from_str(&content))
 }
 
-fn main() {
-    unwrap!(logger::init(true));
+fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
+    thread::spawn(move || loop {
+        {
+            let stats = unwrap!(stats_mutex.lock());
 
-    let _matches = App::new("Crust Proxy")
-        .author("MaidSafe Developers <dev@maidsafe.net>")
-        .about("Runs the bootstrap matching server")
-        .arg(
-            Arg::with_name("config")
-                .long("config")
-                .short("c")
-                .takes_value(true)
-                .help("Config file path"),
-        ).get_matches();
-
-    let config = unwrap!(read_config_file());
-
-    let proxy_config = read_proxy_config();
-
-    let our_pk = PublicEncryptKey::from_bytes(proxy_config.public_key);
-    let _our_sk = SecretEncryptKey::from_bytes(proxy_config.secret_key);
-
-    info!("Our public key is {:?}", our_pk);
-
-    let (category_tx, category_rx) = mpsc::channel();
-    let (crust_tx, crust_rx) = mpsc::channel();
-    let event_tx =
-        MaidSafeObserver::new(crust_tx, MaidSafeEventCategory::Crust, category_tx.clone());
-    let mut service = unwrap!(Service::with_config(event_tx, config, Id(our_pk)));
-
-    // Setup listeners
-    unwrap!(service.start_listening_tcp());
-    if let MaidSafeEventCategory::Crust = unwrap!(category_rx.recv()) {
-    } else {
-        unreachable!("Unexpected category");
-    };
-    if let Event::ListenerStarted(port) = unwrap!(crust_rx.recv()) {
-        info!("Listening on port {}", port);
-    }
-
-    unwrap!(service.set_accept_bootstrap(true));
-
-    info!("Starting bootstrap proxy");
-
-    // Proxy handling peers and their messages
-    let service = Rc::new(RefCell::new(service));
-    let mut proxy = Proxy::new(service.clone());
-
-    // Output stats every 30 seconds
-    thread::spawn(move || {
-        unsafe {
-            let no_hpin = &STATS.no_hairpin;
-            let hpin = &STATS.hairpin;
+            let no_hpin = &stats.no_hairpin;
+            let hpin = &stats.hairpin;
 
             let tcp_totals =
                 hpin.tcp_failures + hpin.tcp_succ + no_hpin.tcp_failures + no_hpin.tcp_succ;
@@ -590,34 +534,99 @@ fn main() {
             };
 
             info!(
-                "\nHole Punching Stats:\n{:#?}.\n\nSuccess stats:\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\n{}TCP (combined) %: {}, UDP (combined) %: {}\n",
-                STATS,
-                if no_hpin_tcp_totals > 0 {
-                    ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
-                } else {
-                    0.0
-                },
-                if no_hpin_udp_totals > 0 {
-                    ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
-                } else {
-                    0.0
-                },
-                hpin_stats,
-                if tcp_totals > 0 {
-                    ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
-                } else {
-                    0.0
-                },
-                if udp_totals > 0 {
-                    ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
-                } else {
-                    0.0
-                },
-            );
+                    "\nHole Punching Stats:\n{:#?}.\n\nSuccess stats:\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\n{}TCP (combined) %: {}, UDP (combined) %: {}\n",
+                    *stats,
+                    if no_hpin_tcp_totals > 0 {
+                        ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    },
+                    if no_hpin_udp_totals > 0 {
+                        ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    },
+                    hpin_stats,
+                    if tcp_totals > 0 {
+                        ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    },
+                    if udp_totals > 0 {
+                        ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    },
+                );
         }
 
         thread::sleep(Duration::from_secs(30));
     });
+}
+
+fn main() {
+    unwrap!(logger::init(true));
+
+    let _matches = App::new("Crust Proxy")
+        .author("MaidSafe Developers <dev@maidsafe.net>")
+        .about("Runs the bootstrap matching server")
+        .arg(
+            Arg::with_name("config")
+                .long("config")
+                .short("c")
+                .takes_value(true)
+                .help("Config file path"),
+        ).get_matches();
+
+    let config = unwrap!(read_config_file());
+
+    let proxy_config = read_proxy_config();
+
+    let our_pk = PublicEncryptKey::from_bytes(proxy_config.public_key);
+
+    info!("Our public key is {:?}", our_pk);
+
+    let (category_tx, category_rx) = mpsc::channel();
+    let (crust_tx, crust_rx) = mpsc::channel();
+    let event_tx =
+        MaidSafeObserver::new(crust_tx, MaidSafeEventCategory::Crust, category_tx.clone());
+    let mut service = unwrap!(Service::with_config(event_tx, config, Id(our_pk)));
+
+    // Setup listeners
+    unwrap!(service.start_listening_tcp());
+    if let MaidSafeEventCategory::Crust = unwrap!(category_rx.recv()) {
+    } else {
+        unreachable!("Unexpected category");
+    };
+    if let Event::ListenerStarted(port) = unwrap!(crust_rx.recv()) {
+        info!("Listening on port {}", port);
+    }
+
+    unwrap!(service.set_accept_bootstrap(true));
+
+    info!("Starting bootstrap proxy");
+
+    let stats = Arc::new(Mutex::new(QuickStats {
+        no_hairpin: StatPairs {
+            tcp_failures: 0,
+            tcp_succ: 0,
+            udp_failures: 0,
+            udp_succ: 0,
+        },
+        hairpin: StatPairs {
+            tcp_failures: 0,
+            tcp_succ: 0,
+            udp_failures: 0,
+            udp_succ: 0,
+        },
+    }));
+
+    // Proxy handling peers and their messages
+    let service = Rc::new(RefCell::new(service));
+    let mut proxy = Proxy::new(service.clone(), stats.clone());
+
+    // Output stats every 30 seconds
+    start_display_stats_thread(stats.clone());
 
     loop {
         match category_rx.recv() {
