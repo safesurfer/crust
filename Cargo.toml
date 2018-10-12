@@ -1,5 +1,6 @@
 [package]
 authors = ["MaidSafe Developers <dev@maidsafe.net>"]
+build = "build.rs"
 description = "Peer-to-peer networking library. Automatically reconnect and manage connections."
 documentation = "https://docs.rs/crust"
 homepage = "https://maidsafe.net"
@@ -30,7 +31,7 @@ get_if_addrs = "~0.4.1"
 
 [dev-dependencies]
 clap = "~2.25.1"
-p2p = { path = "../p2p" }
+p2p = { git = "https://github.com/nbaksalyar/p2p.git", rev = "a48e9bf" }
 safe_crypto = "~0.5.0"
 
 [[example]]
