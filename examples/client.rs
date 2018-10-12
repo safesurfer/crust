@@ -17,16 +17,19 @@
 
 #![allow(deprecated)]
 
-extern crate mio;
-extern crate rust_sodium;
-
 extern crate clap;
 extern crate config_file_handler;
+extern crate crossbeam;
 extern crate crust;
+extern crate get_if_addrs;
+extern crate igd;
+extern crate mio;
+extern crate rust_sodium;
 #[macro_use]
 extern crate log;
 extern crate maidsafe_utilities;
 extern crate p2p;
+extern crate rand;
 extern crate safe_crypto;
 extern crate serde;
 #[macro_use]
@@ -41,25 +44,29 @@ use clap::{App, Arg};
 use common::event_loop::{spawn_event_loop, El};
 use common::{Id, LogUpdate, NatTraversalResult, Os, Rpc};
 use crust::*;
+use get_if_addrs::IfAddr;
+use igd::PortMappingProtocol;
 use maidsafe_utilities::{
     event_sender::{EventSender, MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
     serialisation::{deserialise, serialise, SerialisationError},
+    thread,
 };
 use mio::Poll;
 use p2p::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
     RendezvousInfo, Res,
 };
+use rand::Rng;
 use safe_crypto::PublicEncryptKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::thread;
+use std::thread::sleep;
 use std::time::Duration;
 
 const RETRY_DELAY: u64 = 10;
@@ -69,6 +76,7 @@ pub enum Error {
     Crust(CrustError),
     Unexpected(String),
     Serialisation(SerialisationError),
+    Io(io::Error),
 }
 
 impl Display for Error {
@@ -88,6 +96,12 @@ impl From<CrustError> for Error {
 impl From<SerialisationError> for Error {
     fn from(err: SerialisationError) -> Self {
         Error::Serialisation(err)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(io: io::Error) -> Self {
+        Error::Io(io)
     }
 }
 
@@ -119,8 +133,8 @@ pub fn detect_os() -> Os {
 fn retry_connection(tx: &EventSender<MaidSafeEventCategory, Msg>) {
     let tx2 = tx.clone();
 
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(RETRY_DELAY));
+    thread::named("RetryDelay", move || {
+        sleep(Duration::from_secs(RETRY_DELAY));
         unwrap!(tx2.send(Msg::RetryConnect));
     });
 }
@@ -282,7 +296,9 @@ impl Client {
         Ok(())
     }
 
-    fn probe_nat(&self) -> Result<(), Error> {
+    /// Probes NAT, detects UPnP support, and the user's OS.
+    fn collect_details(&self) -> Result<(), Error> {
+        info!("Detecting NAT type...");
         let (_handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
             Ok(r) => r,
             Err(e) => {
@@ -292,10 +308,20 @@ impl Client {
         };
 
         let nat_type = our_ci.nat_type;
-        let os_type = detect_os();
-
         info!("Detected NAT type {:?}", nat_type);
+
+        let os_type = detect_os();
         info!("Detected OS type: {:?}", os_type);
+
+        let upnp_support = detect_upnp()?;
+        info!(
+            "{}",
+            if upnp_support {
+                "UPnP is supported"
+            } else {
+                "UPnP is not supported"
+            }
+        );
 
         // Send the NAT type to the bootstrap proxy
         self.send_rpc(&Rpc::UpdateDetails {
@@ -475,8 +501,8 @@ fn collect_conn_result(
             }
         };
         if let Some(peer_addr) = peer_addr {
-            thread::spawn(move || {
-                thread::sleep(Duration::from_secs(5));
+            thread::named("TCPConnDrop", move || {
+                sleep(Duration::from_secs(5));
                 drop(tcp_stream);
             });
             Some(ConnStats {
@@ -516,6 +542,86 @@ fn get_user_name() -> Option<String> {
     } else {
         Some(our_name)
     }
+}
+
+fn detect_upnp() -> Result<bool, Error> {
+    // Detect our interfaces
+    info!("Detecting UPnP support...");
+
+    let ifs = get_if_addrs::get_if_addrs()?;
+    let mut ifv4s = Vec::with_capacity(5);
+    for interface in ifs {
+        match interface.addr {
+            IfAddr::V4(v4_addr) => ifv4s.push((v4_addr.ip, None)),
+            _ => (),
+        }
+    }
+
+    crossbeam::scope(|scope| {
+        let mut guards = Vec::with_capacity(ifv4s.len());
+
+        for ifv4 in &mut ifv4s {
+            if !ifv4.0.is_loopback() {
+                guards.push(scope.spawn(move || {
+                    debug!("Searching gateway {:?}", ifv4.0);
+                    ifv4.1 = igd::search_gateway_from_timeout(ifv4.0, Duration::from_secs(1)).ok();
+                }));
+            }
+        }
+    });
+
+    let addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        rand::thread_rng().gen_range(10000, 60000),
+    );
+    let socket = unwrap!(TcpListener::bind(addr));
+    let addr = socket.local_addr()?;
+
+    // Ask IGD
+    let (tx, rx) = mpsc::channel();
+    let igd_children = {
+        let mut igd_children = vec![];
+        debug!("Interfaces: {:?}", ifv4s);
+
+        for (ref ip, ref gateway) in ifv4s {
+            let gateway = match *gateway {
+                Some(ref gateway) => gateway.clone(),
+                None => continue,
+            };
+
+            let addr_igd = SocketAddrV4::new(*ip, addr.port());
+            let tx2 = tx.clone();
+
+            igd_children.push(thread::named("IGD-Address-Mapping", move || {
+                debug!("Getting any address for {:?}", addr_igd);
+                let res =
+                    gateway.get_any_address(PortMappingProtocol::TCP, addr_igd, 10, "MaidSafeNat");
+                let ext_addr = match res {
+                    Ok(ext_addr) => Some(ext_addr),
+                    Err(e) => {
+                        debug!("IGD error: {}", e);
+                        None
+                    }
+                };
+                unwrap!(tx2.send(ext_addr));
+            }));
+        }
+
+        igd_children.len()
+    };
+
+    drop(tx);
+
+    if igd_children > 0 {
+        debug!("Waiting for {} IGD scanners", igd_children);
+        while let Ok(ext_addr) = rx.recv() {
+            if let Some(_) = ext_addr {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 fn get_rendezvous_info(el: &El) -> Res<(p2p::Handle, RendezvousInfo)> {
@@ -573,7 +679,7 @@ fn main() {
     {
         (id, addr)
     } else {
-        error!("\n\nCould not connect with the proxy.\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crusttest.maidsafe.net/\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress any key to continue...");
+        error!("\n\nCould not connect with the proxy.\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crusttest.maidsafe.net/auth.html\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress any key to continue...");
 
         let stdin = io::stdin();
         let mut readline = String::new();
@@ -587,7 +693,7 @@ fn main() {
     let mut client = Client::new(our_pk, proxy_id, our_name, svc, app_tx, p2p_el);
 
     // Probe NAT type
-    unwrap!(client.probe_nat());
+    unwrap!(client.collect_details());
 
     // Find our connection info and wait for peer
     unwrap!(client.await_peer());

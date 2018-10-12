@@ -42,6 +42,7 @@ use maidsafe_utilities::{
     event_sender::{MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
     serialisation::{deserialise, serialise},
+    thread,
 };
 use p2p::{NatType, RendezvousInfo};
 use rand::Rng;
@@ -54,7 +55,7 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::thread::sleep;
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -494,7 +495,7 @@ fn read_proxy_config() -> Config {
 }
 
 fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
-    thread::spawn(move || loop {
+    let joiner = thread::named("StatsPrinter", move || loop {
         {
             let stats = unwrap!(stats_mutex.lock());
 
@@ -560,8 +561,10 @@ fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
                 );
         }
 
-        thread::sleep(Duration::from_secs(30));
+        sleep(Duration::from_secs(30));
     });
+
+    joiner.detach();
 }
 
 fn main() {
