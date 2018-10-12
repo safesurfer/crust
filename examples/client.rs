@@ -63,7 +63,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::sleep;
@@ -328,6 +328,7 @@ impl Client {
             name: self.name.clone(),
             nat: nat_type,
             os: os_type,
+            upnp: upnp_support,
         })
     }
 
@@ -570,12 +571,7 @@ fn detect_upnp() -> Result<bool, Error> {
         }
     });
 
-    let addr = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        rand::thread_rng().gen_range(10000, 60000),
-    );
-    let socket = unwrap!(TcpListener::bind(addr));
-    let addr = socket.local_addr()?;
+    let port = rand::thread_rng().gen_range(10000, std::u16::MAX);
 
     // Ask IGD
     let (tx, rx) = mpsc::channel();
@@ -589,7 +585,7 @@ fn detect_upnp() -> Result<bool, Error> {
                 None => continue,
             };
 
-            let addr_igd = SocketAddrV4::new(*ip, addr.port());
+            let addr_igd = SocketAddrV4::new(*ip, port);
             let tx2 = tx.clone();
 
             igd_children.push(thread::named("IGD-Address-Mapping", move || {

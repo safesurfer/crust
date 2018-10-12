@@ -282,7 +282,7 @@ impl Proxy {
         peer_set.remove(&peer_key); // remove self from the randomised selection process
 
         let known_peers: HashSet<_> = peer_self.peers_known.keys().collect();
-        info!(
+        trace!(
             "{} already knows about {:?}",
             self.peer_name(&peer_key),
             known_peers
@@ -373,7 +373,14 @@ impl Proxy {
         trace!("RPC from {}: {:?}", self.peer_name(&peer_key), rpc_cmd);
 
         match rpc_cmd {
-            Rpc::UpdateDetails { name, nat, os } => {
+            Rpc::UpdateDetails {
+                name,
+                nat,
+                os,
+                upnp,
+            } => {
+                info!("upnp {}", if upnp { "enabled" } else { "disabled" });
+
                 let peer = self.get_peer_mut(&peer_key)?;
                 peer.nat = Some(nat);
                 peer.os = Some(os);
@@ -424,7 +431,7 @@ impl Proxy {
             Rpc::GetPeerReq(name, _public_id, conn) => {
                 self.get_peer_mut(&peer_key)?.conn_info = Some(conn);
                 let pair = self.match_peer(peer_key);
-                info!(
+                trace!(
                     "Matching {} with {}",
                     self.peer_name(&peer_key),
                     if let Some(pk) = pair {

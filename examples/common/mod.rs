@@ -78,6 +78,7 @@ pub enum Rpc {
         name: Option<String>,
         nat: NatType,
         os: Os,
+        upnp: bool,
     },
     GetPeerReq(Option<String>, PublicEncryptKey, RendezvousInfo),
     GetPeerResp(Option<String>, Option<(PublicEncryptKey, RendezvousInfo)>),
