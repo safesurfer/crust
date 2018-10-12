@@ -10,12 +10,12 @@ repository = "https://github.com/maidsafe/crust"
 version = "0.31.0"
 
 [dependencies]
-byteorder = "~1.1.0"
+byteorder = "~1.2.0"
 config_file_handler = "~0.11.0"
 crossbeam = "~0.2.10"
 igd = "~0.6.0"
 log = "~0.3.6"
-maidsafe_utilities = "~0.16.0"
+maidsafe_utilities = "~0.17.0"
 mio = "~0.6.9"
 net2 = "~0.2.30"
 quick-error = "~1.2.2"
@@ -30,8 +30,10 @@ get_if_addrs = "~0.4.1"
 
 [dev-dependencies]
 clap = "~2.25.1"
+p2p = { path = "../p2p" }
+safe_crypto = "*"
 
-[[example]]
-bench = false
-name = "crust_peer"
-path = "examples/crust_peer.rs"
+# [[example]]
+# bench = false
+# name = "crust_peer"
+# path = "examples/crust_peer.rs"
