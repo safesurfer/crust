@@ -19,11 +19,16 @@
 
 pub mod event_loop;
 
-use p2p::RendezvousInfo;
+use crust::Uid;
+use p2p::{NatType, RendezvousInfo};
 use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
+
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Serialize, Deserialize, Debug)]
+pub struct Id(pub PublicEncryptKey);
+impl Uid for Id {}
 
 // With custom Eq/PartialEq implemented to discard `NatTraversalResult::time_spent` as we don't want to account for that in HashSet dedups
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,12 +56,6 @@ impl Hash for NatTraversalResult {
             NatTraversalResult::Succeeded { .. } => 1.hash(state),
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum NatType {
-    EIM,
-    EDM,
 }
 
 #[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]

@@ -39,7 +39,7 @@ mod common;
 
 use clap::{App, Arg};
 use common::event_loop::{spawn_event_loop, El};
-use common::{LogUpdate, NatTraversalResult, NatType, Os, Rpc};
+use common::{Id, LogUpdate, NatTraversalResult, Os, Rpc};
 use crust::*;
 use maidsafe_utilities::{
     event_sender::{EventSender, MaidSafeEventCategory, MaidSafeObserver},
@@ -57,16 +57,10 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
-use std::process;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
-
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Serialize, Deserialize, Debug)]
-struct Id(PublicEncryptKey);
-
-impl Uid for Id {}
+use std::time::Duration;
 
 const RETRY_DELAY: u64 = 10;
 
@@ -289,15 +283,17 @@ impl Client {
     }
 
     fn probe_nat(&self) -> Result<(), Error> {
-        // let nat_type = match el.run(self.service.borrow().probe_nat()) {
-        //     Ok(nat_type) => nat_type,
-        //     Err(e) => {
-        //         error!("Could not detect the NAT type: {}", e);
-        //         panic!("Aborting due to the previous error");
-        //     }
-        // };
-        let nat_type = NatType::EIM;
+        let (_handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to detect our NAT type: {}", e);
+                panic!("Aborting due to the previous error");
+            }
+        };
+
+        let nat_type = our_ci.nat_type;
         let os_type = detect_os();
+
         info!("Detected NAT type {:?}", nat_type);
         info!("Detected OS type: {:?}", os_type);
 
@@ -336,7 +332,7 @@ impl Client {
     fn send_rpc(&self, rpc: &Rpc) -> Result<(), Error> {
         trace!("Sending {}", rpc);
         let bytes = serialise(&rpc)?;
-        self.service.borrow().send(&self.proxy_id, bytes, 0);
+        self.service.borrow().send(&self.proxy_id, bytes, 0)?;
         Ok(())
     }
 
@@ -440,7 +436,13 @@ impl Client {
     }
 
     fn await_peer(&mut self) -> Result<(), Error> {
-        let (handle, our_ci) = unwrap!(get_rendezvous_info(&self.p2p_el));
+        let (handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to get our connection info: {}", e);
+                panic!("Aborting due to the previous error");
+            }
+        };
         trace!("Our requester CI: {:?}", our_ci);
 
         self.p2p_handle = Some(handle);
@@ -531,7 +533,7 @@ fn get_rendezvous_info(el: &El) -> Res<(p2p::Handle, RendezvousInfo)> {
 fn main() {
     unwrap!(logger::init(true));
 
-    let matches = App::new("Crust Client Example")
+    let _matches = App::new("Crust Client Example")
         .author("MaidSafe Developers <dev@maidsafe.net>")
         .about("Connects to the bootstrap matching server")
         .arg(
@@ -554,7 +556,7 @@ fn main() {
         MaidSafeObserver::new(crust_tx, MaidSafeEventCategory::Crust, category_tx.clone());
     let app_tx = MaidSafeObserver::new(app_msg_tx, MaidSafeEventCategory::Routing, category_tx);
 
-    let (our_pk, our_sk) = safe_crypto::gen_encrypt_keypair();
+    let (our_pk, _our_sk) = safe_crypto::gen_encrypt_keypair();
     let mut svc = unwrap!(Service::with_config(event_tx, config, Id(our_pk)));
 
     info!("Our public ID: {}", our_pk);
@@ -562,10 +564,14 @@ fn main() {
     info!("Attempting bootstrap...");
     unwrap!(svc.start_bootstrap(Default::default(), CrustUser::Client));
 
-    let proxy_id = if let Event::BootstrapAccept::<_>(id, CrustUser::Client) =
-        unwrap!(crust_rx.try_recv())
+    if let MaidSafeEventCategory::Crust = unwrap!(category_rx.recv()) {
+    } else {
+        unreachable!("Unexpected category");
+    };
+    let (proxy_id, proxy_addr) = if let Event::BootstrapConnect::<_>(id, addr) =
+        unwrap!(crust_rx.recv())
     {
-        id
+        (id, addr)
     } else {
         error!("\n\nCould not connect with the proxy.\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crusttest.maidsafe.net/\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress any key to continue...");
 
@@ -576,11 +582,7 @@ fn main() {
         panic!("Aborting due to the previous error");
     };
 
-    info!(
-        "Connected to {}",
-        proxy_id.0,
-        // unwrap!(proxy.addr())
-    );
+    info!("Connected to {} ({})", proxy_id.0, proxy_addr);
 
     let mut client = Client::new(our_pk, proxy_id, our_name, svc, app_tx, p2p_el);
 
@@ -594,8 +596,7 @@ fn main() {
         match category_rx.recv() {
             Ok(MaidSafeEventCategory::Routing) => match app_msg_rx.try_recv() {
                 Err(e) => {
-                    error!("{}", e);
-                    break;
+                    warn!("{}", e);
                 }
                 Ok(msg) => {
                     let res = match msg {
@@ -610,10 +611,11 @@ fn main() {
                 }
             },
             Ok(MaidSafeEventCategory::Crust) => match crust_rx.try_recv() {
-                Ok(_) => {
-                    // .. do nothing
-                }
                 Ok(Event::NewMessage(peer_id, _user, data)) => {
+                    if peer_id != proxy_id {
+                        warn!("Unknown peer: {}", peer_id.0);
+                        continue;
+                    }
                     let rpc: Rpc = unwrap!(deserialise(&data));
                     unwrap!(client.handle_new_message(rpc));
                 }
@@ -621,9 +623,11 @@ fn main() {
                     info!("Disconnected from the proxy");
                     break;
                 }
+                Ok(event) => {
+                    trace!("Unexpected event {:?}", event);
+                }
                 Err(e) => {
-                    error!("{}", e);
-                    break;
+                    warn!("{}", e);
                 }
             },
             Err(e) => {

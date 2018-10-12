@@ -15,16 +15,12 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-extern crate config_file_handler;
-extern crate mio;
-extern crate p2p_old;
-extern crate rust_sodium;
-
-extern crate bytes;
 extern crate clap;
+extern crate config_file_handler;
 extern crate crust;
-extern crate future_utils;
-extern crate futures;
+extern crate mio;
+extern crate p2p;
+extern crate rust_sodium;
 #[macro_use]
 extern crate log;
 extern crate maidsafe_utilities;
@@ -34,8 +30,6 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
-extern crate tokio_core;
-extern crate tokio_timer;
 #[macro_use]
 extern crate unwrap;
 
@@ -70,27 +64,27 @@ static mut STATS: QuickStats = QuickStats {
 
 mod common;
 
-use bytes::Bytes;
 use clap::{App, Arg};
-use common::{NatTraversalResult, Os, Rpc};
-use crust::{ConfigFile, CrustError, CrustUser, NatType, PaAddr, Peer, PeerError, Service};
-use futures::sync::mpsc::{self, UnboundedSender};
-use futures::{future::empty, stream::SplitSink, Future, Sink, Stream};
+use common::{Id, NatTraversalResult, Os, Rpc};
+use crust::*;
 use maidsafe_utilities::{
+    event_sender::{MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
     serialisation::{deserialise, serialise},
 };
-use p2p_old::RendezvousInfo;
+use p2p::{NatType, RendezvousInfo};
 use rand::Rng;
 use safe_crypto::{PublicEncryptKey, SecretEncryptKey};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
-use tokio_core::reactor::{Core, Handle};
-use tokio_timer::Interval;
+use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 mod stats {
     use serde_json;
@@ -126,15 +120,15 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<CrustError> for Error {
-    fn from(err: CrustError) -> Self {
-        Error::Crust(err)
+impl From<mpsc::TryRecvError> for Error {
+    fn from(err: mpsc::TryRecvError) -> Self {
+        Error::Unexpected(format!("Recv error: {}", err))
     }
 }
 
-impl From<PeerError> for Error {
-    fn from(err: PeerError) -> Self {
-        Error::Unexpected(format!("{}", err))
+impl From<CrustError> for Error {
+    fn from(err: CrustError) -> Self {
+        Error::Crust(err)
     }
 }
 
@@ -154,45 +148,27 @@ pub struct LogEntry {
     tcp_hole_punch_result: NatTraversalResult,
 }
 
-#[derive(Debug)]
-enum Msg {
-    NewPeer(Peer),
-    LostPeer(PublicEncryptKey),
-    Message(PublicEncryptKey, Rpc),
-}
-
 #[derive(Eq, PartialEq, Hash, Debug)]
 enum PeerStatus {
     Pending,
     Matched,
 }
 
-struct Proxy {
-    handle: Handle,
-    peers: HashMap<PublicEncryptKey, ConnectedPeer>,
-    msg_tx: UnboundedSender<Msg>,
-}
-
 struct ConnectedPeer {
     id: PublicEncryptKey,
-    addr: PaAddr,
+    addr: IpAddr,
     conn_info: Option<RendezvousInfo>,
     nat: Option<NatType>,
     os: Option<Os>,
     name: Option<String>,
     peers_known: HashMap<PublicEncryptKey, PeerStatus>,
-    tx: UnboundedSender<Bytes>,
 }
 
 impl ConnectedPeer {
-    fn new(id: PublicEncryptKey, addr: PaAddr, handle: Handle, sink: SplitSink<Peer>) -> Self {
-        let (tx, rx) = mpsc::unbounded::<Bytes>();
-        handle.spawn(sink.sink_map_err(|_| ()).send_all(rx).then(move |_| Ok(())));
-
+    fn new(id: PublicEncryptKey, addr: IpAddr) -> Self {
         ConnectedPeer {
             id,
             addr,
-            tx,
             name: None,
             nat: None,
             os: None,
@@ -200,29 +176,30 @@ impl ConnectedPeer {
             conn_info: None,
         }
     }
+}
 
-    fn send_rpc(&self, rpc: &Rpc) -> Result<(), Error> {
-        let bytes = unwrap!(serialise(rpc));
-        self.tx
-            .unbounded_send(Bytes::from(bytes))
-            .map_err(|e| From::from(format!("{}", e)))
-    }
+struct Proxy {
+    peers: HashMap<PublicEncryptKey, ConnectedPeer>,
+    service: Rc<RefCell<Service<Id>>>,
 }
 
 impl Proxy {
-    fn new(handle: Handle, msg_tx: UnboundedSender<Msg>) -> Self {
+    fn new(service: Rc<RefCell<Service<Id>>>) -> Self {
         Proxy {
-            handle,
+            service,
             peers: Default::default(),
-            msg_tx,
         }
     }
 
-    fn tx(&self) -> UnboundedSender<Msg> {
-        self.msg_tx.clone()
+    fn send_rpc(&self, peer: &Id, rpc: &Rpc) -> Result<(), Error> {
+        let bytes = unwrap!(serialise(rpc));
+        self.service.borrow().send(peer, bytes, 0)?;
+        Ok(())
     }
 
-    fn lost_peer(&mut self, peer_key: PublicEncryptKey) -> Result<(), Error> {
+    fn lost_peer(&mut self, peer_id: Id) -> Result<(), Error> {
+        let peer_key = peer_id.0;
+
         info!("Disconnected peer {}", self.peer_name(&peer_key));
 
         let _ = self.peers.remove(&peer_key);
@@ -244,50 +221,24 @@ impl Proxy {
         Ok(())
     }
 
-    fn new_peer(&mut self, peer: Peer) -> Result<(), Error> {
-        if self.peers.contains_key(&peer.public_id()) {
+    fn new_peer(&mut self, peer: Id) -> Result<(), Error> {
+        let peer_key = peer.0;
+
+        if self.peers.contains_key(&peer_key) {
             warn!(
                 "Peer ID {} attempted to connect once again; dropping connection",
-                peer.public_id()
+                peer_key
             );
-            self.handle
-                .spawn(peer.finalize().map_err(|e| error!("{}", e)));
+            self.service.borrow().disconnect(&peer);
             return Ok(());
         }
 
-        let peer_key = peer.public_id().clone();
-        let peer_key2 = peer.public_id().clone();
-
-        let peer_addr = peer.addr()?;
+        let peer_addr = self.service.borrow().get_peer_ip_addr(&peer)?;
 
         info!("New peer! ID: {}, addr: {:?}", peer_key, peer_addr);
 
-        let (peer_sink, peer_stream) = peer.split();
-
-        let new_peer =
-            ConnectedPeer::new(peer_key.clone(), peer_addr, self.handle.clone(), peer_sink);
+        let new_peer = ConnectedPeer::new(peer_key.clone(), peer_addr);
         self.peers.insert(peer_key, new_peer);
-
-        let msg_tx = self.tx();
-        let msg_tx2 = self.tx();
-
-        self.handle.spawn(
-            peer_stream
-                .for_each(move |bytes| {
-                    match deserialise(&*bytes) {
-                        Ok(rpc) => {
-                            unwrap!(msg_tx.unbounded_send(Msg::Message(peer_key, rpc)));
-                        }
-                        Err(e) => {
-                            error!("{}", e);
-                        }
-                    }
-                    Ok(())
-                }).then(move |_| {
-                    unwrap!(msg_tx2.unbounded_send(Msg::LostPeer(peer_key2)));
-                    Ok(())
-                }),
-        );
 
         Ok(())
     }
@@ -311,18 +262,24 @@ impl Proxy {
             };
             let requester_name = { self.get_peer(&requester_id)?.name.clone() };
 
-            let peer = self.get_peer_mut(&new_pair)?;
-            peer.peers_known.insert(requester_id, PeerStatus::Matched);
+            let peer_id = {
+                let peer = self.get_peer_mut(&new_pair)?;
+                peer.peers_known.insert(requester_id, PeerStatus::Matched);
 
-            peer.send_rpc(&Rpc::GetPeerReq(
-                if name.is_none() { requester_name } else { name },
-                requester_id,
-                conn_info,
-            ))
+                Id(peer.id)
+            };
+
+            self.send_rpc(
+                &peer_id,
+                &Rpc::GetPeerReq(
+                    if name.is_none() { requester_name } else { name },
+                    requester_id,
+                    conn_info,
+                ),
+            )
         } else {
             // No pairing peer was found
-            self.get_peer(&requester_id)?
-                .send_rpc(&Rpc::GetPeerResp(None, None))
+            self.send_rpc(&Id(requester_id), &Rpc::GetPeerResp(None, None))
         }
     }
 
@@ -421,7 +378,8 @@ impl Proxy {
             }).unwrap_or_else(|_| format!("{}", peer_key))
     }
 
-    fn new_message(&mut self, peer_key: PublicEncryptKey, rpc_cmd: Rpc) -> Result<(), Error> {
+    fn new_message(&mut self, peer: Id, rpc_cmd: Rpc) -> Result<(), Error> {
+        let peer_key = peer.0;
         trace!("RPC from {}: {:?}", self.peer_name(&peer_key), rpc_cmd);
 
         match rpc_cmd {
@@ -444,7 +402,7 @@ impl Proxy {
                     }
 
                     let peer_requester = common::Peer {
-                        ip: if let IpAddr::V4(ip_addr) = self.get_peer(&peer_key)?.addr.ip() {
+                        ip: if let IpAddr::V4(ip_addr) = self.get_peer(&peer_key)?.addr {
                             ip_addr
                         } else {
                             unimplemented!("IPv6 is not supported");
@@ -454,7 +412,7 @@ impl Proxy {
                     };
 
                     let peer_responder = common::Peer {
-                        ip: if let IpAddr::V4(ip_addr) = self.get_peer(&log.peer)?.addr.ip() {
+                        ip: if let IpAddr::V4(ip_addr) = self.get_peer(&log.peer)?.addr {
                             ip_addr
                         } else {
                             unimplemented!("IPv6 is not supported")
@@ -505,10 +463,17 @@ impl Proxy {
                 if let Some(pair_peer_key) = pair_peer_key {
                     info!("Connecting with {}", self.peer_name(&pair_peer_key));
 
-                    let pair_peer = self.get_peer_mut(&pair_peer_key)?;
-                    pair_peer.peers_known.insert(peer_key, PeerStatus::Matched);
-                    pair_peer
-                        .send_rpc(&Rpc::GetPeerResp(name, Some((peer_key, connection_info))))?;
+                    let pair_peer_id = {
+                        let pair_peer = self.get_peer_mut(&pair_peer_key)?;
+                        pair_peer.peers_known.insert(peer_key, PeerStatus::Matched);
+
+                        Id(pair_peer.id)
+                    };
+
+                    self.send_rpc(
+                        &pair_peer_id,
+                        &Rpc::GetPeerResp(name, Some((peer_key, connection_info))),
+                    )?;
                 } else {
                     error!("Not found matching peer");
                 }
@@ -542,7 +507,7 @@ fn read_proxy_config() -> Config {
 fn main() {
     unwrap!(logger::init(true));
 
-    let matches = App::new("Crust Proxy")
+    let _matches = App::new("Crust Proxy")
         .author("MaidSafe Developers <dev@maidsafe.net>")
         .about("Runs the bootstrap matching server")
         .arg(
@@ -553,42 +518,38 @@ fn main() {
                 .help("Config file path"),
         ).get_matches();
 
-    let config = unwrap!(if let Some(cfg_path) = matches.value_of("config") {
-        info!("Loading config from {}", cfg_path);
-        ConfigFile::open_path(From::from(cfg_path))
-    } else {
-        ConfigFile::open_default()
-    });
-
-    let mut event_loop = unwrap!(Core::new());
-    let handle = event_loop.handle();
+    let config = unwrap!(read_config_file());
 
     let proxy_config = read_proxy_config();
 
     let our_pk = PublicEncryptKey::from_bytes(proxy_config.public_key);
-    let our_sk = SecretEncryptKey::from_bytes(proxy_config.secret_key);
+    let _our_sk = SecretEncryptKey::from_bytes(proxy_config.secret_key);
 
     info!("Our public key is {:?}", our_pk);
 
-    let mut svc = unwrap!(event_loop.run(Service::with_config(&handle, config, our_sk, our_pk)));
+    let (category_tx, category_rx) = mpsc::channel();
+    let (crust_tx, crust_rx) = mpsc::channel();
+    let event_tx =
+        MaidSafeObserver::new(crust_tx, MaidSafeEventCategory::Crust, category_tx.clone());
+    let mut service = unwrap!(Service::with_config(event_tx, config, Id(our_pk)));
+
+    // Setup listeners
+    unwrap!(service.start_listening_tcp());
+    if let MaidSafeEventCategory::Crust = unwrap!(category_rx.recv()) {
+    } else {
+        unreachable!("Unexpected category");
+    };
+    if let Event::ListenerStarted(port) = unwrap!(crust_rx.recv()) {
+        info!("Listening on port {}", port);
+    }
+
+    unwrap!(service.set_accept_bootstrap(true));
 
     info!("Starting bootstrap proxy");
 
     // Proxy handling peers and their messages
-    let (proxy_tx, proxy_rx) = mpsc::unbounded();
-    let mut proxy = Proxy::new(handle.clone(), proxy_tx.clone());
-
-    handle.spawn(proxy_rx.for_each(move |msg| {
-        let res = match msg {
-            Msg::NewPeer(peer) => proxy.new_peer(peer),
-            Msg::LostPeer(peer) => proxy.lost_peer(peer),
-            Msg::Message(id, rpc) => proxy.new_message(id, rpc),
-        };
-        if let Err(e) = res {
-            error!("{}", e);
-        }
-        Ok(())
-    }));
+    let service = Rc::new(RefCell::new(service));
+    let mut proxy = Proxy::new(service.clone());
 
     // Output stats every 30 seconds
     thread::spawn(move || {
@@ -596,10 +557,12 @@ fn main() {
             let no_hpin = &STATS.no_hairpin;
             let hpin = &STATS.hairpin;
 
-            let tcp_totals = hpin.tcp_failures + hpin.tcp_succ + no_hpin.tcp_failures + no_hpin.tcp_succ;
+            let tcp_totals =
+                hpin.tcp_failures + hpin.tcp_succ + no_hpin.tcp_failures + no_hpin.tcp_succ;
             let tcp_totals_succ = hpin.tcp_succ + no_hpin.tcp_succ;
 
-            let udp_totals = hpin.udp_failures + hpin.udp_succ + no_hpin.udp_failures + no_hpin.udp_succ;
+            let udp_totals =
+                hpin.udp_failures + hpin.udp_succ + no_hpin.udp_failures + no_hpin.udp_succ;
             let udp_totals_succ = hpin.udp_succ + no_hpin.udp_succ;
 
             let hpin_tcp_totals = hpin.tcp_failures + hpin.tcp_succ;
@@ -609,17 +572,18 @@ fn main() {
             let no_hpin_udp_totals = no_hpin.udp_failures + no_hpin.udp_succ;
 
             let hpin_stats = if hpin_tcp_totals > 0 || hpin_udp_totals > 0 {
-                format!("TCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\n",
-                        if hpin_tcp_totals > 0 {
-                            ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
-                        } else {
-                            0.0
-                        },
-                        if hpin_udp_totals > 0 {
-                            ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
-                        } else {
-                            0.0
-                        }
+                format!(
+                    "TCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\n",
+                    if hpin_tcp_totals > 0 {
+                        ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    },
+                    if hpin_udp_totals > 0 {
+                        ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
+                    } else {
+                        0.0
+                    }
                 )
             } else {
                 "".to_owned()
@@ -653,62 +617,57 @@ fn main() {
         }
 
         thread::sleep(Duration::from_secs(30));
-    );
-
-    // Setup listeners
-    service.start_listening_tcp();
+    });
 
     loop {
         match category_rx.recv() {
-            Ok(MaidSafeEventCategory::Routing) => match app_msg_rx.try_recv() {
-                Err(e) => {
-                    error!("{}", e);
-                    break;
-                }
-                Ok(msg) => {
-                    /*
-                    let res = match msg {
-                        Msg::RetryConnect => client.await_peer(),
-                        Msg::ConnectedWithPeer(peer_id, full_stats, send_stats) => {
-                            client.report_connection_result(peer_id, full_stats, send_stats)
+            Ok(MaidSafeEventCategory::Crust) => {
+                let res = match crust_rx.try_recv() {
+                    Ok(Event::NewMessage(peer_id, user, data)) => {
+                        if user == CrustUser::Node {
+                            warn!(
+                                "Attempted to connect Node {:?}, terminating connection",
+                                peer_id
+                            );
+                            service.borrow().disconnect(&peer_id);
+                            continue;
                         }
-                    };
-                    if let Err(e) = res {
-                        error!("{}", e);
+                        let rpc: Rpc = match deserialise(&*data) {
+                            Ok(rpc) => rpc,
+                            Err(e) => {
+                                error!("{}", e);
+                                continue;
+                            }
+                        };
+                        proxy.new_message(peer_id, rpc)
                     }
-*/
-                }
-            },
-            Ok(MaidSafeEventCategory::Crust) => match crust_rx.try_recv() {
-                Ok(_) => {
-                    // .. do nothing
-                }
-                Ok(Event::NewMessage(peer_id, _user, data)) => {
-                    let rpc: Rpc = unwrap!(deserialise(&data));
-                    unwrap!(client.handle_new_message(rpc));
-                }
-                Ok(Event::BootstrapAccept(peer_id, user)) => {
-                    if user == CrustUser::Node {
-                        warn!(
-                            "Attempted to connect Node {:?}, terminating connection",
-                            peer_id
-                        );
-                        service.disconnect(peer_id);
-                        continue;
+                    Ok(Event::BootstrapAccept(peer_id, user)) => {
+                        if user == CrustUser::Node {
+                            warn!(
+                                "Attempted to connect Node {:?}, terminating connection",
+                                peer_id
+                            );
+                            service.borrow().disconnect(&peer_id);
+                            continue;
+                        }
+                        proxy.new_peer(peer_id)
                     }
-                    proxy.new_peer(peer_id);
+                    Ok(Event::LostPeer(peer_id)) => proxy.lost_peer(peer_id),
+                    Ok(_) => {
+                        // .. do nothing
+                        Ok(())
+                    }
+                    Err(e) => Err(From::from(e)),
+                };
+                if let Err(e) = res {
+                    warn!("{}", e);
                 }
-                Ok(Event::LostPeer(peer_id)) => {
-                    proxy.lost_peer(peer_id);
-                }
-                Err(e) => {
-                    error!("{}", e);
-                    break;
-                }
-            },
+            }
+            Ok(cat) => {
+                warn!("Unexpected category {:?}", cat);
+            }
             Err(e) => {
-                error!("{}", e);
-                break;
+                warn!("{}", e);
             }
         }
     }
