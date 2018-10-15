@@ -44,7 +44,7 @@ use maidsafe_utilities::{
     serialisation::{deserialise, serialise},
     thread,
 };
-use p2p::{NatType, RendezvousInfo};
+use p2p::{NatType as P2pNatType, RendezvousInfo};
 use rand::Rng;
 use safe_crypto::PublicEncryptKey;
 use std::cell::RefCell;
@@ -147,7 +147,7 @@ struct ConnectedPeer {
     id: PublicEncryptKey,
     addr: IpAddr,
     conn_info: Option<RendezvousInfo>,
-    nat: Option<NatType>,
+    nat: Option<P2pNatType>,
     os: Option<Os>,
     name: Option<String>,
     peers_known: HashMap<PublicEncryptKey, PeerStatus>,
@@ -423,7 +423,7 @@ impl Proxy {
                         } else {
                             unimplemented!("IPv6 is not supported");
                         },
-                        nat_type: requester.nat.clone().ok_or(Error::PartialPeerInfo)?,
+                        nat_type: From::from(requester.nat.clone().ok_or(Error::PartialPeerInfo)?),
                         os: format!("{}", requester.os.clone().ok_or(Error::PartialPeerInfo)?),
                     };
 
@@ -433,7 +433,7 @@ impl Proxy {
                         } else {
                             unimplemented!("IPv6 is not supported")
                         },
-                        nat_type: responder.nat.clone().ok_or(Error::PartialPeerInfo)?,
+                        nat_type: From::from(responder.nat.clone().ok_or(Error::PartialPeerInfo)?),
                         os: format!("{}", responder.os.clone().ok_or(Error::PartialPeerInfo)?),
                     };
 

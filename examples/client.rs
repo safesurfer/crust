@@ -55,7 +55,7 @@ use maidsafe_utilities::{
 use mio::Poll;
 use p2p::{
     Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
-    RendezvousInfo, Res,
+    NatType as P2pNatType, RendezvousInfo, Res,
 };
 use rand::Rng;
 use safe_crypto::PublicEncryptKey;
@@ -161,6 +161,7 @@ struct Client {
     failed_conns: Vec<PublicEncryptKey>,
     our_id: PublicEncryptKey,
     our_ci: Option<RendezvousInfo>,
+    our_nat_type: Option<P2pNatType>,
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
@@ -189,6 +190,7 @@ impl Client {
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
             our_ci: None,
+            our_nat_type: None,
             p2p_el,
             display_available_peers: true,
         }
@@ -298,7 +300,7 @@ impl Client {
     }
 
     /// Probes NAT, detects UPnP support, and the user's OS.
-    fn collect_details(&self) -> Result<(), Error> {
+    fn collect_details(&mut self) -> Result<(), Error> {
         info!("Detecting NAT type...");
         let (_handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
             Ok(r) => r,
@@ -323,6 +325,8 @@ impl Client {
                 "UPnP is not supported"
             }
         );
+
+        self.our_nat_type = Some(nat_type.clone());
 
         // Send the NAT type to the bootstrap proxy
         self.send_rpc(&Rpc::UpdateDetails {

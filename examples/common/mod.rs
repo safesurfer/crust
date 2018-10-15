@@ -20,7 +20,7 @@
 pub mod event_loop;
 
 use crust::Uid;
-use p2p::{NatType, RendezvousInfo};
+use p2p::{NatType as P2pNatType, RendezvousInfo};
 use safe_crypto::PublicEncryptKey;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -58,6 +58,33 @@ impl Hash for NatTraversalResult {
     }
 }
 
+/// Network Address Translation type that the front-end expects
+#[derive(Debug, Hash, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub enum NatType {
+    /// We failed to detect NAT type.
+    Unknown,
+    /// No NAT - direct connection is possible.
+    None,
+    /// Endpoint Independent Mapping
+    EIM,
+    /// Endpoint Dependent Mapping where we can guess a next port.
+    EDM,
+    /// Endpoint Dependent Mapping with unpredictable port allocation.
+    EDMRandomPorts(Vec<u16>),
+}
+
+impl From<P2pNatType> for NatType {
+    fn from(p2p_nat_type: P2pNatType) -> Self {
+        match p2p_nat_type {
+            P2pNatType::EIM => NatType::EIM,
+            P2pNatType::EDM => NatType::EDM,
+            P2pNatType::EDMRandomPorts(v) => NatType::EDMRandomPorts(v),
+            P2pNatType::EDMRandomIp(_) => NatType::EDM,
+            P2pNatType::Unknown => NatType::Unknown,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]
 pub struct Peer {
     pub ip: Ipv4Addr,
@@ -76,7 +103,7 @@ pub struct LogUpdate {
 pub enum Rpc {
     UpdateDetails {
         name: Option<String>,
-        nat: NatType,
+        nat: P2pNatType,
         os: Os,
         upnp: bool,
         version: String,
