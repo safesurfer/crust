@@ -139,7 +139,7 @@ fn retry_connection(tx: &EventSender<MaidSafeEventCategory, Msg>) {
     thread::named("RetryDelay", move || {
         sleep(Duration::from_secs(RETRY_DELAY));
         unwrap!(tx2.send(Msg::RetryConnect));
-    });
+    }).detach();
 }
 
 #[derive(Debug)]
@@ -402,7 +402,7 @@ impl Client {
                     unwrap!(self.p2p_handle.take()).fire_hole_punch(
                         ci,
                         Box::new(move |_, _, res| {
-                            // Hole punch success
+                            // Hole punch result
                             let full_stats = collect_conn_result(&our_ci, res, &udp_hp);
                             unwrap!(
                                 client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, true))
@@ -453,9 +453,8 @@ impl Client {
                 handle.fire_hole_punch(
                     their_ci,
                     Box::new(move |_, _, res| {
-                        // Hole punch success
+                        // Hole punch result
                         let full_stats = collect_conn_result(&our_ci2, res, &udp_hp);
-
                         unwrap!(
                             client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, false))
                         );
@@ -516,7 +515,8 @@ fn collect_conn_result(
             thread::named("TCPConnDrop", move || {
                 sleep(Duration::from_secs(5));
                 drop(sock);
-            });
+            }).detach();
+
             Some((
                 ConnAddr {
                     our: unwrap!(our_ci.tcp),
@@ -532,6 +532,7 @@ fn collect_conn_result(
     };
 
     let udp = if let Some(UdpHolePunchInfo {
+        sock,
         peer,
         starting_ttl,
         ttl_on_being_reached,
@@ -539,6 +540,11 @@ fn collect_conn_result(
         ..
     }) = udp
     {
+        thread::named("UDSockDrop", move || {
+            sleep(Duration::from_secs(5));
+            drop(sock);
+        }).detach();
+
         // Derive our ext addr given the starting TTL
         if let Some((hole_puncher_idx, _hole_puncher)) = udp_hole_punchers
             .iter()
