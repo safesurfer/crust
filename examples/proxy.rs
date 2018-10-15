@@ -36,7 +36,7 @@ extern crate unwrap;
 mod common;
 
 use clap::{App, Arg};
-use common::{Id, NatTraversalResult, Os, Rpc};
+use common::{Id, NatTraversalResult, Os, PeerDetails, Rpc};
 use crust::*;
 use maidsafe_utilities::{
     event_sender::{MaidSafeEventCategory, MaidSafeObserver},
@@ -147,9 +147,7 @@ struct ConnectedPeer {
     id: PublicEncryptKey,
     addr: IpAddr,
     conn_info: Option<RendezvousInfo>,
-    nat: Option<P2pNatType>,
-    os: Option<Os>,
-    name: Option<String>,
+    details: Option<PeerDetails>,
     peers_known: HashMap<PublicEncryptKey, PeerStatus>,
 }
 
@@ -158,9 +156,7 @@ impl ConnectedPeer {
         ConnectedPeer {
             id,
             addr,
-            name: None,
-            nat: None,
-            os: None,
+            details: None,
             peers_known: HashMap::default(),
             conn_info: None,
         }
@@ -251,7 +247,12 @@ impl Proxy {
                     .ok_or_else(|| Error::PeerNotFound(requester_id.clone()))?
                     .clone()
             };
-            let requester_name = { self.get_peer(&requester_id)?.name.clone() };
+            let requester_name = {
+                self.get_peer(&requester_id)?
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.name.clone())
+            };
 
             let peer_id = {
                 let peer = self.get_peer_mut(&new_pair)?;
@@ -298,7 +299,7 @@ impl Proxy {
             // filter out peers that don't have connection info
             .filter(|peer| {
                 if let Some(p) = self.peers.get(**peer) {
-                    p.conn_info.is_some() && p.nat.is_some()
+                    p.conn_info.is_some() && p.details.is_some()
                 } else {
                     false
                 }
@@ -364,8 +365,9 @@ impl Proxy {
         self.get_peer(peer_key)
             .map_err(|_| ())
             .and_then(|p| {
-                p.name
-                    .clone()
+                p.details
+                    .as_ref()
+                    .and_then(|d| d.name.clone())
                     .ok_or(())
                     .map(|name| format!("{} ({})", name, peer_key))
             }).unwrap_or_else(|_| format!("{}", peer_key))
@@ -376,23 +378,14 @@ impl Proxy {
         trace!("RPC from {}: {:?}", self.peer_name(&peer_key), rpc_cmd);
 
         match rpc_cmd {
-            Rpc::UpdateDetails {
-                name,
-                nat,
-                os,
-                upnp,
-                version,
-            } => {
-                info!(
-                    "UPNP for {} is {}",
-                    self.peer_name(&peer_key),
-                    if upnp { "enabled" } else { "disabled" }
-                );
+            Rpc::UpdateDetails(peer_details) => {
+                let json = serde_json::to_string(&peer_details)?;
+                info!("UpdateDetails {} {}", peer_key, json);
 
-                if &version != GIT_COMMIT {
+                if &peer_details.version != GIT_COMMIT {
                     info!(
                         "Wrong client version {} used by {}, disconnecting",
-                        version,
+                        peer_details.version,
                         self.peer_name(&peer_key)
                     );
                     self.send_rpc(&peer, &Rpc::WrongVersion(GIT_COMMIT.to_owned()))?;
@@ -401,11 +394,12 @@ impl Proxy {
                 }
 
                 let peer = self.get_peer_mut(&peer_key)?;
-                peer.nat = Some(nat);
-                peer.os = Some(os);
-                peer.name = name;
+                peer.details = Some(peer_details);
             }
             Rpc::UploadLog(log) => {
+                let json = serde_json::to_string(&log)?;
+                info!("UploadLog {} {}", peer_key, json);
+
                 let (peer_requester, peer_responder) = {
                     let requester = self.get_peer(&peer_key)?;
                     let responder = self.get_peer(&log.peer)?;
@@ -423,8 +417,21 @@ impl Proxy {
                         } else {
                             unimplemented!("IPv6 is not supported");
                         },
-                        nat_type: From::from(requester.nat.clone().ok_or(Error::PartialPeerInfo)?),
-                        os: format!("{}", requester.os.clone().ok_or(Error::PartialPeerInfo)?),
+                        nat_type: From::from(
+                            requester
+                                .details
+                                .as_ref()
+                                .map(|d| d.nat_type())
+                                .ok_or(Error::PartialPeerInfo)?,
+                        ),
+                        os: format!(
+                            "{}",
+                            requester
+                                .details
+                                .as_ref()
+                                .map(|d| d.os.clone())
+                                .ok_or(Error::PartialPeerInfo)?
+                        ),
                     };
 
                     let peer_responder = common::Peer {
@@ -433,8 +440,21 @@ impl Proxy {
                         } else {
                             unimplemented!("IPv6 is not supported")
                         },
-                        nat_type: From::from(responder.nat.clone().ok_or(Error::PartialPeerInfo)?),
-                        os: format!("{}", responder.os.clone().ok_or(Error::PartialPeerInfo)?),
+                        nat_type: From::from(
+                            responder
+                                .details
+                                .as_ref()
+                                .map(|d| d.nat_type())
+                                .ok_or(Error::PartialPeerInfo)?,
+                        ),
+                        os: format!(
+                            "{}",
+                            responder
+                                .details
+                                .as_ref()
+                                .map(|d| d.os.clone())
+                                .ok_or(Error::PartialPeerInfo)?
+                        ),
                     };
 
                     (peer_requester, peer_responder)
@@ -443,8 +463,8 @@ impl Proxy {
                 self.add_log(LogEntry {
                     peer_requester,
                     peer_responder,
-                    udp_hole_punch_result: log.udp_hole_punch_result,
-                    tcp_hole_punch_result: log.tcp_hole_punch_result,
+                    udp_hole_punch_result: From::from(log.udp_hole_punch_result),
+                    tcp_hole_punch_result: From::from(log.tcp_hole_punch_result),
                 })?;
             }
             Rpc::GetPeerReq(name, _public_id, conn) => {

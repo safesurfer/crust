@@ -42,7 +42,7 @@ mod common;
 
 use clap::{App, Arg};
 use common::event_loop::{spawn_event_loop, El};
-use common::{Id, LogUpdate, NatTraversalResult, Os, Rpc};
+use common::{Id, LogUpdate, Os, PeerDetails, Rpc, TcpNatTraversalResult, UdpNatTraversalResult};
 use crust::*;
 use get_if_addrs::IfAddr;
 use igd::PortMappingProtocol;
@@ -54,14 +54,16 @@ use maidsafe_utilities::{
 };
 use mio::Poll;
 use p2p::{
-    Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
-    NatType as P2pNatType, RendezvousInfo, Res,
+    Config, Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
+    NatType as P2pNatType, RendezvousInfo, Res, TcpHolePunchInfo, UdpHolePunchInfo,
 };
 use rand::Rng;
 use safe_crypto::PublicEncryptKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+use std::fs::File;
+use std::io::Read;
 use std::io::{self, BufRead, Write};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::rc::Rc;
@@ -141,15 +143,15 @@ fn retry_connection(tx: &EventSender<MaidSafeEventCategory, Msg>) {
 }
 
 #[derive(Debug)]
-struct ConnStats {
-    our: Option<SocketAddr>,
-    their: Option<SocketAddr>,
+struct ConnAddr {
+    our: SocketAddr,
+    their: SocketAddr,
 }
 
 #[derive(Debug)]
 struct FullConnStats {
-    tcp: Option<ConnStats>,
-    udp: Option<ConnStats>,
+    tcp: Option<(ConnAddr, TcpNatTraversalResult)>,
+    udp: Option<(ConnAddr, UdpNatTraversalResult)>,
 }
 
 struct Client {
@@ -161,12 +163,14 @@ struct Client {
     failed_conns: Vec<PublicEncryptKey>,
     our_id: PublicEncryptKey,
     our_ci: Option<RendezvousInfo>,
-    our_nat_type: Option<P2pNatType>,
+    our_nat_type_udp: Option<P2pNatType>,
+    our_nat_type_tcp: Option<P2pNatType>,
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
     p2p_el: El,
     display_available_peers: bool,
+    udp_hole_punchers: Vec<u8>, // a vec of UdpHolePuncher::starting_ttl
 }
 
 impl Client {
@@ -177,6 +181,7 @@ impl Client {
         service: Service<Id>,
         client_tx: EventSender<MaidSafeEventCategory, Msg>,
         p2p_el: El,
+        udp_hole_punchers: Vec<u8>,
     ) -> Self {
         Client {
             our_id,
@@ -190,9 +195,11 @@ impl Client {
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
             our_ci: None,
-            our_nat_type: None,
+            our_nat_type_tcp: None,
+            our_nat_type_udp: None,
             p2p_el,
             display_available_peers: true,
+            udp_hole_punchers,
         }
     }
 
@@ -228,16 +235,8 @@ impl Client {
         if let Ok(FullConnStats { ref tcp, .. }) = conn_res {
             log_output.push_str(&format!(
                 "TCP result: {}\n",
-                if let Some(tcp) = tcp {
-                    format!(
-                        "{} (us) <-> {} (them)",
-                        tcp.our
-                            .map(|ip| format!("{}", ip))
-                            .unwrap_or_else(|| "None".to_string()),
-                        tcp.their
-                            .map(|ip| format!("{}", ip))
-                            .unwrap_or_else(|| "None".to_string())
-                    )
+                if let Some((tcp, _)) = tcp {
+                    format!("{} (us) <-> {} (them)", tcp.our, tcp.their,)
                 } else {
                     "Failed".to_owned()
                 }
@@ -246,16 +245,8 @@ impl Client {
         if let Ok(FullConnStats { ref udp, .. }) = conn_res {
             log_output.push_str(&format!(
                 "UDP result: {}\n",
-                if let Some(udp) = udp {
-                    format!(
-                        "{} (us) <-> {} (them)",
-                        udp.our
-                            .map(|ip| format!("{}", ip))
-                            .unwrap_or_else(|| "None".to_string()),
-                        udp.their
-                            .map(|ip| format!("{}", ip))
-                            .unwrap_or_else(|| "None".to_string())
-                    )
+                if let Some((udp, _)) = udp {
+                    format!("{} (us) <-> {} (them)", udp.our, udp.their)
                 } else {
                     "Failed".to_owned()
                 }
@@ -310,8 +301,10 @@ impl Client {
             }
         };
 
-        let nat_type = our_ci.nat_type;
-        info!("Detected NAT type {:?}", nat_type);
+        let nat_type_tcp = our_ci.nat_type_for_tcp;
+        info!("Detected NAT type for TCP {:?}", nat_type_tcp);
+        let nat_type_udp = our_ci.nat_type_for_udp;
+        info!("Detected NAT type for UDP {:?}", nat_type_udp);
 
         let os_type = detect_os();
         info!("Detected OS type: {:?}", os_type);
@@ -326,16 +319,18 @@ impl Client {
             }
         );
 
-        self.our_nat_type = Some(nat_type.clone());
+        self.our_nat_type_tcp = Some(nat_type_tcp.clone());
+        self.our_nat_type_udp = Some(nat_type_udp.clone());
 
         // Send the NAT type to the bootstrap proxy
-        self.send_rpc(&Rpc::UpdateDetails {
+        self.send_rpc(&Rpc::UpdateDetails(PeerDetails {
             name: self.name.clone(),
-            nat: nat_type,
+            nat_type_udp,
+            nat_type_tcp,
             os: os_type,
             upnp: upnp_support,
             version: GIT_COMMIT.to_owned(),
-        })
+        }))
     }
 
     fn aggregate_stats(
@@ -343,16 +338,16 @@ impl Client {
         peer: PublicEncryptKey,
         conn_res: Result<FullConnStats, ()>,
     ) -> LogUpdate {
-        let mut tcp_hole_punch_result = NatTraversalResult::Failed;
-        let mut udp_hole_punch_result = NatTraversalResult::Failed;
+        let mut tcp_hole_punch_result = TcpNatTraversalResult::Failed;
+        let mut udp_hole_punch_result = UdpNatTraversalResult::Failed;
 
         if let Ok(res) = conn_res {
-            if res.tcp.is_some() {
-                tcp_hole_punch_result = NatTraversalResult::Succeeded
-            };
-            if res.udp.is_some() {
-                udp_hole_punch_result = NatTraversalResult::Succeeded
-            };
+            if let Some((_, tcp_traversal_result)) = res.tcp {
+                tcp_hole_punch_result = tcp_traversal_result;
+            }
+            if let Some((_, udp_traversal_result)) = res.udp {
+                udp_hole_punch_result = udp_traversal_result;
+            }
         }
 
         LogUpdate {
@@ -402,12 +397,13 @@ impl Client {
 
                     let client_tx = self.client_tx.clone();
                     let our_ci = unwrap!(self.our_ci.take());
+                    let udp_hp = self.udp_hole_punchers.clone();
 
                     unwrap!(self.p2p_handle.take()).fire_hole_punch(
                         ci,
                         Box::new(move |_, _, res| {
                             // Hole punch success
-                            let full_stats = collect_conn_result(&our_ci, res);
+                            let full_stats = collect_conn_result(&our_ci, res, &udp_hp);
                             unwrap!(
                                 client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, true))
                             );
@@ -452,12 +448,13 @@ impl Client {
                 trace!("Our responder CI: {:?}", our_ci);
 
                 let our_ci2 = our_ci.clone();
+                let udp_hp = self.udp_hole_punchers.clone();
 
                 handle.fire_hole_punch(
                     their_ci,
                     Box::new(move |_, _, res| {
                         // Hole punch success
-                        let full_stats = collect_conn_result(&our_ci2, res);
+                        let full_stats = collect_conn_result(&our_ci2, res, &udp_hp);
 
                         unwrap!(
                             client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, false))
@@ -497,6 +494,7 @@ impl Client {
 fn collect_conn_result(
     our_ci: &RendezvousInfo,
     conn_res: Result<HolePunchInfo, NatError>,
+    udp_hole_punchers: &Vec<u8>,
 ) -> Result<FullConnStats, ()> {
     let HolePunchInfo { tcp, udp, .. } = match conn_res {
         Ok(conn_info) => conn_info,
@@ -506,8 +504,8 @@ fn collect_conn_result(
         }
     };
 
-    let tcp = if let Some((tcp_stream, _tcp_token)) = tcp {
-        let peer_addr = match tcp_stream.peer_addr() {
+    let tcp = if let Some(TcpHolePunchInfo { sock, dur, .. }) = tcp {
+        let peer_addr = match sock.peer_addr() {
             Ok(pa) => Some(pa),
             Err(e) => {
                 debug!("Failed to get TCP peer address: {}", e);
@@ -517,12 +515,15 @@ fn collect_conn_result(
         if let Some(peer_addr) = peer_addr {
             thread::named("TCPConnDrop", move || {
                 sleep(Duration::from_secs(5));
-                drop(tcp_stream);
+                drop(sock);
             });
-            Some(ConnStats {
-                our: Some(unwrap!(our_ci.tcp)),
-                their: Some(peer_addr),
-            })
+            Some((
+                ConnAddr {
+                    our: unwrap!(our_ci.tcp),
+                    their: peer_addr,
+                },
+                TcpNatTraversalResult::Succeeded { time_spent: dur },
+            ))
         } else {
             None
         }
@@ -530,11 +531,48 @@ fn collect_conn_result(
         None
     };
 
-    let udp = if let Some((_udp_sock, udp_peer, udp_our_ext_addr, _udp_token)) = udp {
-        Some(ConnStats {
-            our: Some(udp_our_ext_addr),
-            their: Some(udp_peer),
-        })
+    let udp = if let Some(UdpHolePunchInfo {
+        peer,
+        starting_ttl,
+        ttl_on_being_reached,
+        dur,
+        ..
+    }) = udp
+    {
+        // Derive our ext addr given the starting TTL
+        if let Some((hole_puncher_idx, _hole_puncher)) = udp_hole_punchers
+            .iter()
+            .enumerate()
+            .find(|(_, puncher_starting_ttl)| **puncher_starting_ttl == starting_ttl as u8)
+        {
+            let our_external_addr = our_ci.udp.get(hole_puncher_idx);
+
+            if let Some(our) = our_external_addr {
+                Some((
+                    ConnAddr {
+                        our: our.clone(),
+                        their: peer,
+                    },
+                    UdpNatTraversalResult::Succeeded {
+                        time_spent: dur,
+                        starting_ttl,
+                        ttl_on_being_reached,
+                    },
+                ))
+            } else {
+                debug!(
+                    "P2P didn't provide our IP address in RendezvousInfo. hole_puncher_idx: {}",
+                    hole_puncher_idx
+                );
+                None
+            }
+        } else {
+            debug!(
+                "Unexpected starting_ttl passed from p2p: {}, no hole puncher found",
+                starting_ttl
+            );
+            None
+        }
     } else {
         None
     };
@@ -661,9 +699,26 @@ fn main() {
 
     let config = unwrap!(read_config_file());
 
-    let our_name = get_user_name();
-    let p2p_el = spawn_event_loop();
+    // Init P2P config and spawn the event loop
+    let current_bin_dir = unwrap!(config_file_handler::current_bin_dir());
 
+    let mut file = unwrap!(File::open(format!(
+        "{}/p2p-config",
+        unwrap!(current_bin_dir.as_path().to_str())
+    )));
+    let mut content = String::new();
+    unwrap!(file.read_to_string(&mut content));
+    let p2p_config: Config = unwrap!(serde_json::from_str(&content));
+    let udp_hole_punchers = p2p_config
+        .udp_hole_punchers
+        .iter()
+        .map(|udp_hp| udp_hp.starting_ttl)
+        .collect();
+
+    let our_name = get_user_name();
+    let p2p_el = spawn_event_loop(p2p_config);
+
+    // Init Crust
     let (category_tx, category_rx) = mpsc::channel();
     let (crust_tx, crust_rx) = mpsc::channel();
     let (app_msg_tx, app_msg_rx) = mpsc::channel();
@@ -699,7 +754,15 @@ fn main() {
 
     info!("Connected to {} ({})", proxy_id.0, proxy_addr);
 
-    let mut client = Client::new(our_pk, proxy_id, our_name, svc, app_tx, p2p_el);
+    let mut client = Client::new(
+        our_pk,
+        proxy_id,
+        our_name,
+        svc,
+        app_tx,
+        p2p_el,
+        udp_hole_punchers,
+    );
 
     // Probe NAT type
     unwrap!(client.collect_details());

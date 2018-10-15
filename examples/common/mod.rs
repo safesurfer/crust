@@ -23,37 +23,50 @@ use crust::Uid;
 use p2p::{NatType as P2pNatType, RendezvousInfo};
 use safe_crypto::PublicEncryptKey;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Serialize, Deserialize, Debug)]
 pub struct Id(pub PublicEncryptKey);
 impl Uid for Id {}
 
 // With custom Eq/PartialEq implemented to discard `NatTraversalResult::time_spent` as we don't want to account for that in HashSet dedups
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
 pub enum NatTraversalResult {
     Failed,
     Succeeded,
 }
 
-impl PartialEq for NatTraversalResult {
-    fn eq(&self, other: &NatTraversalResult) -> bool {
-        match (self, other) {
-            (NatTraversalResult::Failed, NatTraversalResult::Failed) => true,
-            (NatTraversalResult::Succeeded, NatTraversalResult::Succeeded) => true,
-            _ => false,
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TcpNatTraversalResult {
+    Failed,
+    Succeeded { time_spent: Duration },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum UdpNatTraversalResult {
+    Failed,
+    Succeeded {
+        time_spent: Duration,
+        starting_ttl: u32,
+        ttl_on_being_reached: u32,
+    },
+}
+
+impl From<TcpNatTraversalResult> for NatTraversalResult {
+    fn from(nat_res: TcpNatTraversalResult) -> Self {
+        match nat_res {
+            TcpNatTraversalResult::Failed => NatTraversalResult::Failed,
+            TcpNatTraversalResult::Succeeded { .. } => NatTraversalResult::Succeeded,
         }
     }
 }
 
-impl Eq for NatTraversalResult {}
-
-impl Hash for NatTraversalResult {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            NatTraversalResult::Failed => 0.hash(state),
-            NatTraversalResult::Succeeded { .. } => 1.hash(state),
+impl From<UdpNatTraversalResult> for NatTraversalResult {
+    fn from(nat_res: UdpNatTraversalResult) -> Self {
+        match nat_res {
+            UdpNatTraversalResult::Failed => NatTraversalResult::Failed,
+            UdpNatTraversalResult::Succeeded { .. } => NatTraversalResult::Succeeded,
         }
     }
 }
@@ -73,13 +86,13 @@ pub enum NatType {
     EDMRandomPorts(Vec<u16>),
 }
 
-impl From<P2pNatType> for NatType {
-    fn from(p2p_nat_type: P2pNatType) -> Self {
+impl<'a> From<&'a P2pNatType> for NatType {
+    fn from(p2p_nat_type: &P2pNatType) -> Self {
         match p2p_nat_type {
             P2pNatType::EIM => NatType::EIM,
-            P2pNatType::EDM => NatType::EDM,
-            P2pNatType::EDMRandomPorts(v) => NatType::EDMRandomPorts(v),
-            P2pNatType::EDMRandomIp(_) => NatType::EDM,
+            P2pNatType::EDM(_delta) => NatType::EDM,
+            P2pNatType::EDMRandomPort(ports) => NatType::EDMRandomPorts(ports.clone()),
+            P2pNatType::EDMRandomIp(_ips) => NatType::EDM,
             P2pNatType::Unknown => NatType::Unknown,
         }
     }
@@ -94,20 +107,35 @@ pub struct Peer {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogUpdate {
-    pub peer: PublicEncryptKey, // TODO: force IP address here; allow only the one we use to connect with the proxy
-    pub udp_hole_punch_result: NatTraversalResult,
-    pub tcp_hole_punch_result: NatTraversalResult,
+    pub peer: PublicEncryptKey,
+    pub udp_hole_punch_result: UdpNatTraversalResult,
+    pub tcp_hole_punch_result: TcpNatTraversalResult,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PeerDetails {
+    pub name: Option<String>,
+    pub nat_type_tcp: P2pNatType,
+    pub nat_type_udp: P2pNatType,
+    pub os: Os,
+    pub upnp: bool,
+    pub version: String,
+}
+
+impl PeerDetails {
+    pub fn nat_type(&self) -> NatType {
+        From::from(match (&self.nat_type_tcp, &self.nat_type_udp) {
+            (P2pNatType::Unknown, udp) => udp,
+            (tcp, P2pNatType::Unknown) => tcp,
+            (tcp, udp) if tcp == udp => tcp,
+            (_tcp, udp) => udp,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Rpc {
-    UpdateDetails {
-        name: Option<String>,
-        nat: P2pNatType,
-        os: Os,
-        upnp: bool,
-        version: String,
-    },
+    UpdateDetails(PeerDetails),
     GetPeerReq(Option<String>, PublicEncryptKey, RendezvousInfo),
     GetPeerResp(Option<String>, Option<(PublicEncryptKey, RendezvousInfo)>),
     UploadLog(LogUpdate),
