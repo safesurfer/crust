@@ -58,6 +58,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
+const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
+
 #[derive(Debug, Default)]
 struct StatPairs {
     tcp_failures: u64,
@@ -90,6 +92,7 @@ pub enum Error {
     PartialPeerInfo,
     WrongPeerPairing(PublicEncryptKey, PublicEncryptKey),
     PeerNotFound(PublicEncryptKey),
+    WrongPeerVersion(String),
 }
 
 impl Display for Error {
@@ -378,8 +381,24 @@ impl Proxy {
                 nat,
                 os,
                 upnp,
+                version,
             } => {
-                info!("upnp {}", if upnp { "enabled" } else { "disabled" });
+                info!(
+                    "UPNP for {} is {}",
+                    self.peer_name(&peer_key),
+                    if upnp { "enabled" } else { "disabled" }
+                );
+
+                if &version != GIT_COMMIT {
+                    info!(
+                        "Wrong client version {} used by {}, disconnecting",
+                        version,
+                        self.peer_name(&peer_key)
+                    );
+                    self.send_rpc(&peer, &Rpc::WrongVersion(GIT_COMMIT.to_owned()))?;
+                    self.service.borrow().disconnect(&peer);
+                    return Err(Error::WrongPeerVersion(GIT_COMMIT.to_owned()));
+                }
 
                 let peer = self.get_peer_mut(&peer_key)?;
                 peer.nat = Some(nat);

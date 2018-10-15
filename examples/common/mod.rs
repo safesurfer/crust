@@ -79,10 +79,12 @@ pub enum Rpc {
         nat: NatType,
         os: Os,
         upnp: bool,
+        version: String,
     },
     GetPeerReq(Option<String>, PublicEncryptKey, RendezvousInfo),
     GetPeerResp(Option<String>, Option<(PublicEncryptKey, RendezvousInfo)>),
     UploadLog(LogUpdate),
+    WrongVersion(String),
 }
 
 impl fmt::Display for Rpc {
@@ -97,6 +99,7 @@ impl fmt::Display for Rpc {
                 if opt.is_none() { "None" } else { "Some" }
             ),
             UploadLog(..) => write!(fmt, "UploadLog"),
+            WrongVersion(..) => write!(fmt, "WrongVersion"),
         }
     }
 }

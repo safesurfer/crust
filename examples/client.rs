@@ -70,6 +70,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 const RETRY_DELAY: u64 = 10;
+const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
 
 #[derive(Debug)]
 pub enum Error {
@@ -329,6 +330,7 @@ impl Client {
             nat: nat_type,
             os: os_type,
             upnp: upnp_support,
+            version: GIT_COMMIT.to_owned(),
         })
     }
 
@@ -375,6 +377,13 @@ impl Client {
         trace!("Received {}", rpc_cmd);
 
         match rpc_cmd {
+            Rpc::WrongVersion(expected_version) => {
+                info!(
+                    "\n\nYou're using an outdated version of the client (you are using version {}, but the latest version is {}).\nPlease download the latest available version from https://github.com/maidsafe/crust/releases and restart the client.\n",
+                    &GIT_COMMIT[0..6],
+                    &expected_version[0..6]
+                );
+            }
             Rpc::GetPeerResp(name, ci_opt) => {
                 if let Some((their_id, ci)) = ci_opt {
                     // Attempt to connect with peer
@@ -692,7 +701,14 @@ fn main() {
     unwrap!(client.collect_details());
 
     // Find our connection info and wait for peer
-    unwrap!(client.await_peer());
+    match client.await_peer() {
+        Ok(_) => (),
+        Err(Error::Crust(CrustError::PeerNotFound)) => {
+            // Probably the proxy has disconnected us, wait for new messages.
+            ()
+        }
+        Err(e) => unwrap!(Err(e)),
+    }
 
     loop {
         match category_rx.recv() {
