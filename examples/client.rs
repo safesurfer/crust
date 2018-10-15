@@ -675,13 +675,13 @@ fn main() {
     {
         (id, addr)
     } else {
-        error!("\n\nCould not connect with the proxy.\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crusttest.maidsafe.net/auth.html\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress any key to continue...");
+        error!("\n\nCould not connect with the proxy.\n\nThis probably means that your IP address is not registered. Please follow this link for registration: https://crusttest.maidsafe.net/auth.html\nIf you have registered your IP address and still getting this error it could mean the proxy is down or not reachable. Please contact us and provide the log file.\n\nPress Enter to continue...");
 
         let stdin = io::stdin();
         let mut readline = String::new();
         unwrap!(stdin.lock().read_line(&mut readline));
 
-        panic!("Aborting due to the previous error");
+        return;
     };
 
     info!("Connected to {} ({})", proxy_id.0, proxy_addr);
