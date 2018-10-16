@@ -21,13 +21,13 @@ pub mod event_loop;
 
 use crust::Uid;
 use p2p::{NatType as P2pNatType, RendezvousInfo};
-use safe_crypto::PublicEncryptKey;
+use rust_sodium::crypto::box_::PublicKey;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Serialize, Deserialize, Debug)]
-pub struct Id(pub PublicEncryptKey);
+pub struct Id(pub PublicKey);
 impl Uid for Id {}
 
 // With custom Eq/PartialEq implemented to discard `NatTraversalResult::time_spent` as we don't want to account for that in HashSet dedups
@@ -107,7 +107,7 @@ pub struct Peer {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogUpdate {
-    pub peer: PublicEncryptKey,
+    pub peer: PublicKey,
     pub udp_hole_punch_result: UdpNatTraversalResult,
     pub tcp_hole_punch_result: TcpNatTraversalResult,
 }
@@ -136,8 +136,8 @@ impl PeerDetails {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Rpc {
     UpdateDetails(PeerDetails),
-    GetPeerReq(Option<String>, PublicEncryptKey, RendezvousInfo),
-    GetPeerResp(Option<String>, Option<(PublicEncryptKey, RendezvousInfo)>),
+    GetPeerReq(Option<String>, PublicKey, RendezvousInfo),
+    GetPeerResp(Option<String>, Option<(PublicKey, RendezvousInfo)>),
     UploadLog(LogUpdate),
     WrongVersion(String),
 }

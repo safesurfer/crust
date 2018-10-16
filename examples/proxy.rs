@@ -15,9 +15,9 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-extern crate clap;
 extern crate config_file_handler;
 extern crate crust;
+extern crate hex_fmt;
 extern crate mio;
 extern crate p2p;
 extern crate rust_sodium;
@@ -25,7 +25,6 @@ extern crate rust_sodium;
 extern crate log;
 extern crate maidsafe_utilities;
 extern crate rand;
-extern crate safe_crypto;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -35,28 +34,28 @@ extern crate unwrap;
 
 mod common;
 
-use clap::{App, Arg};
 use common::{Id, NatTraversalResult, Os, PeerDetails, Rpc};
 use crust::*;
+use hex_fmt::HexFmt;
 use maidsafe_utilities::{
     event_sender::{MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
     serialisation::{deserialise, serialise},
     thread,
 };
-use p2p::{NatType as P2pNatType, RendezvousInfo};
+use p2p::RendezvousInfo;
 use rand::Rng;
-use safe_crypto::PublicEncryptKey;
+use rust_sodium::crypto::box_;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
-use std::fs::File;
-use std::io::Read;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
+
+type PublicEncryptKey = box_::PublicKey;
 
 const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
 
@@ -213,8 +212,8 @@ impl Proxy {
 
         if self.peers.contains_key(&peer_key) {
             warn!(
-                "Peer ID {} attempted to connect once again; dropping connection",
-                peer_key
+                "Peer ID {:<8} attempted to connect once again; dropping connection",
+                HexFmt(peer_key.0)
             );
             self.service.borrow().disconnect(&peer);
             return Ok(());
@@ -222,7 +221,11 @@ impl Proxy {
 
         let peer_addr = self.service.borrow().get_peer_ip_addr(&peer)?;
 
-        info!("New peer! ID: {}, addr: {:?}", peer_key, peer_addr);
+        info!(
+            "New peer! ID: {:<8}, addr: {:?}",
+            HexFmt(peer_key.0),
+            peer_addr
+        );
 
         let new_peer = ConnectedPeer::new(peer_key.clone(), peer_addr);
         self.peers.insert(peer_key, new_peer);
@@ -369,8 +372,8 @@ impl Proxy {
                     .as_ref()
                     .and_then(|d| d.name.clone())
                     .ok_or(())
-                    .map(|name| format!("{} ({})", name, peer_key))
-            }).unwrap_or_else(|_| format!("{}", peer_key))
+                    .map(|name| format!("{} ({:<8})", name, HexFmt(peer_key.0)))
+            }).unwrap_or_else(|_| format!("{:<8}", HexFmt(peer_key.0)))
     }
 
     fn new_message(&mut self, peer: Id, rpc_cmd: Rpc) -> Result<(), Error> {
@@ -380,7 +383,7 @@ impl Proxy {
         match rpc_cmd {
             Rpc::UpdateDetails(peer_details) => {
                 let json = serde_json::to_string(&peer_details)?;
-                info!("UpdateDetails {} {}", peer_key, json);
+                info!("UpdateDetails {:<8} {}", HexFmt(peer_key.0), json);
 
                 if &peer_details.version != GIT_COMMIT {
                     info!(
@@ -398,7 +401,7 @@ impl Proxy {
             }
             Rpc::UploadLog(log) => {
                 let json = serde_json::to_string(&log)?;
-                info!("UploadLog {} {}", peer_key, json);
+                info!("UploadLog {:<8} {}", HexFmt(peer_key), json);
 
                 let (peer_requester, peer_responder) = {
                     let requester = self.get_peer(&peer_key)?;
@@ -523,23 +526,6 @@ impl Proxy {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    secret_key: [u8; 32],
-    public_key: [u8; 32],
-}
-
-fn read_proxy_config() -> Config {
-    let current_bin_dir = unwrap!(config_file_handler::current_bin_dir());
-    let mut file = unwrap!(File::open(format!(
-        "{}/proxy-config",
-        unwrap!(current_bin_dir.as_path().to_str())
-    )));
-    let mut content = String::new();
-    unwrap!(file.read_to_string(&mut content));
-    unwrap!(serde_json::from_str(&content))
-}
-
 fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
     let joiner = thread::named("StatsPrinter", move || loop {
         {
@@ -607,7 +593,7 @@ fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
                 );
         }
 
-        sleep(Duration::from_secs(30));
+        sleep(Duration::from_secs(60));
     });
 
     joiner.detach();
@@ -616,24 +602,11 @@ fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
 fn main() {
     unwrap!(logger::init(true));
 
-    let _matches = App::new("Crust Proxy")
-        .author("MaidSafe Developers <dev@maidsafe.net>")
-        .about("Runs the bootstrap matching server")
-        .arg(
-            Arg::with_name("config")
-                .long("config")
-                .short("c")
-                .takes_value(true)
-                .help("Config file path"),
-        ).get_matches();
-
     let config = unwrap!(read_config_file());
 
-    let proxy_config = read_proxy_config();
+    let (our_pk, _our_sk) = box_::gen_keypair();
 
-    let our_pk = PublicEncryptKey::from_bytes(proxy_config.public_key);
-
-    info!("Our public key is {:?}", our_pk);
+    info!("Our public key is {:<8}", HexFmt(our_pk.0));
 
     let (category_tx, category_rx) = mpsc::channel();
     let (crust_tx, crust_rx) = mpsc::channel();
@@ -674,7 +647,7 @@ fn main() {
     let service = Rc::new(RefCell::new(service));
     let mut proxy = Proxy::new(service.clone(), stats.clone());
 
-    // Output stats every 30 seconds
+    // Output stats every 60 seconds
     start_display_stats_thread(stats.clone());
 
     loop {

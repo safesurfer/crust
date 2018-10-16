@@ -158,7 +158,7 @@ impl Drop for El {
     }
 }
 
-pub fn spawn_event_loop(config: Config) -> El {
+pub fn spawn_event_loop(config: Config, enc_pk: box_::PublicKey, enc_sk: box_::SecretKey) -> El {
     let (core_tx, core_rx) = channel::channel::<CoreMsg>();
     let (nat_tx, nat_rx) = channel::channel();
     let nat_tx_cloned = nat_tx.clone();
@@ -170,7 +170,6 @@ pub fn spawn_event_loop(config: Config) -> El {
 
         let poll = unwrap!(Poll::new());
 
-        let (enc_pk, enc_sk) = box_::gen_keypair();
         let nat_timer = Timer::default();
 
         unwrap!(poll.register(

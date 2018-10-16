@@ -17,20 +17,19 @@
 
 #![allow(deprecated)]
 
-extern crate clap;
 extern crate config_file_handler;
 extern crate crossbeam;
 extern crate crust;
 extern crate get_if_addrs;
+extern crate hex_fmt;
 extern crate igd;
 extern crate mio;
-extern crate rust_sodium;
 #[macro_use]
 extern crate log;
 extern crate maidsafe_utilities;
 extern crate p2p;
 extern crate rand;
-extern crate safe_crypto;
+extern crate rust_sodium;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -40,11 +39,11 @@ extern crate unwrap;
 
 mod common;
 
-use clap::{App, Arg};
 use common::event_loop::{spawn_event_loop, El};
 use common::{Id, LogUpdate, Os, PeerDetails, Rpc, TcpNatTraversalResult, UdpNatTraversalResult};
 use crust::*;
 use get_if_addrs::IfAddr;
+use hex_fmt::HexFmt;
 use igd::PortMappingProtocol;
 use maidsafe_utilities::{
     event_sender::{EventSender, MaidSafeEventCategory, MaidSafeObserver},
@@ -58,7 +57,7 @@ use p2p::{
     NatType as P2pNatType, RendezvousInfo, Res, TcpHolePunchInfo, UdpHolePunchInfo,
 };
 use rand::Rng;
-use safe_crypto::PublicEncryptKey;
+use rust_sodium::crypto::box_;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -70,6 +69,8 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::Duration;
+
+pub type PublicEncryptKey = box_::PublicKey;
 
 const RETRY_DELAY: u64 = 10;
 const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
@@ -372,9 +373,9 @@ impl Client {
 
     fn get_peer_name(&self, id: PublicEncryptKey) -> String {
         if let Some(name) = self.peer_names.get(&id) {
-            format!("{} ({})", name, id)
+            format!("{} ({:<8})", name, HexFmt(id))
         } else {
-            format!("{}", id)
+            format!("{:<8}", HexFmt(id))
         }
     }
 
@@ -698,17 +699,6 @@ fn get_rendezvous_info(el: &El) -> Res<(p2p::Handle, RendezvousInfo)> {
 fn main() {
     unwrap!(logger::init(true));
 
-    let _matches = App::new("Crust Client Example")
-        .author("MaidSafe Developers <dev@maidsafe.net>")
-        .about("Connects to the bootstrap matching server")
-        .arg(
-            Arg::with_name("config")
-                .long("config")
-                .short("c")
-                .takes_value(true)
-                .help("Config file path"),
-        ).get_matches();
-
     let config = unwrap!(read_config_file());
 
     // Init P2P config and spawn the event loop
@@ -727,8 +717,10 @@ fn main() {
         .map(|udp_hp| udp_hp.starting_ttl)
         .collect();
 
+    let (our_pk, our_sk) = box_::gen_keypair();
+
     let our_name = get_user_name();
-    let p2p_el = spawn_event_loop(p2p_config);
+    let p2p_el = spawn_event_loop(p2p_config, our_pk.clone(), our_sk);
 
     // Init Crust
     let (category_tx, category_rx) = mpsc::channel();
@@ -738,10 +730,9 @@ fn main() {
         MaidSafeObserver::new(crust_tx, MaidSafeEventCategory::Crust, category_tx.clone());
     let app_tx = MaidSafeObserver::new(app_msg_tx, MaidSafeEventCategory::Routing, category_tx);
 
-    let (our_pk, _our_sk) = safe_crypto::gen_encrypt_keypair();
     let mut svc = unwrap!(Service::with_config(event_tx, config, Id(our_pk)));
 
-    info!("Our public ID: {}", our_pk);
+    info!("Our public ID: {:<8}", HexFmt(our_pk));
 
     info!("Attempting bootstrap...");
     unwrap!(svc.start_bootstrap(Default::default(), CrustUser::Client));
@@ -764,7 +755,7 @@ fn main() {
         return;
     };
 
-    info!("Connected to {} ({})", proxy_id.0, proxy_addr);
+    info!("Connected to {:<8} ({})", HexFmt(proxy_id.0), proxy_addr);
 
     let mut client = Client::new(
         our_pk,
@@ -810,7 +801,7 @@ fn main() {
             Ok(MaidSafeEventCategory::Crust) => match crust_rx.try_recv() {
                 Ok(Event::NewMessage(peer_id, _user, data)) => {
                     if peer_id != proxy_id {
-                        warn!("Unknown peer: {}", peer_id.0);
+                        warn!("Unknown peer: {:<8}", HexFmt(peer_id.0));
                         continue;
                     }
                     let rpc: Rpc = unwrap!(deserialise(&data));
