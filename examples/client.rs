@@ -235,8 +235,11 @@ impl Client {
         if let Ok(FullConnStats { ref tcp, .. }) = conn_res {
             log_output.push_str(&format!(
                 "TCP result: {}\n",
-                if let Some((tcp, _)) = tcp {
-                    format!("{} (us) <-> {} (them)", tcp.our, tcp.their,)
+                if let Some((tcp, TcpNatTraversalResult::Succeeded { time_spent })) = tcp {
+                    format!(
+                        "{} (us) <-> {} (them), connected in {:?}",
+                        tcp.our, tcp.their, time_spent
+                    )
                 } else {
                     "Failed".to_owned()
                 }
@@ -245,8 +248,11 @@ impl Client {
         if let Ok(FullConnStats { ref udp, .. }) = conn_res {
             log_output.push_str(&format!(
                 "UDP result: {}\n",
-                if let Some((udp, _)) = udp {
-                    format!("{} (us) <-> {} (them)", udp.our, udp.their)
+                if let Some((udp, UdpNatTraversalResult::Succeeded { time_spent, .. })) = udp {
+                    format!(
+                        "{} (us) <-> {} (them), connected in {:?}",
+                        udp.our, udp.their, time_spent
+                    )
                 } else {
                     "Failed".to_owned()
                 }
