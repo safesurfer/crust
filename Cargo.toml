@@ -32,7 +32,7 @@ get_if_addrs = "~0.4.1"
 
 [dev-dependencies]
 clap = "~2.25.1"
-p2p = { git = "https://github.com/nbaksalyar/p2p.git", rev = "a48e9bf" }
+p2p = { git = "https://github.com/nbaksalyar/p2p.git", rev = "0ab127f" }
 safe_crypto = "~0.5.0"
 
 [[example]]
