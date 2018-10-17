@@ -53,8 +53,8 @@ use maidsafe_utilities::{
 };
 use mio::Poll;
 use p2p::{
-    Config, Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatMsg,
-    NatType as P2pNatType, RendezvousInfo, Res, TcpHolePunchInfo, UdpHolePunchInfo,
+    Config, Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatInfo,
+    NatMsg, NatType as P2pNatType, RendezvousInfo, Res, TcpHolePunchInfo, UdpHolePunchInfo,
 };
 use rand::Rng;
 use rust_sodium::crypto::box_;
@@ -164,8 +164,7 @@ struct Client {
     failed_conns: Vec<PublicEncryptKey>,
     our_id: PublicEncryptKey,
     our_ci: Option<RendezvousInfo>,
-    our_nat_type_udp: Option<P2pNatType>,
-    our_nat_type_tcp: Option<P2pNatType>,
+    our_nat_info: NatInfo,
     p2p_handle: Option<P2pHandle>,
     name: Option<String>,
     peer_names: HashMap<PublicEncryptKey, String>,
@@ -196,8 +195,7 @@ impl Client {
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
             our_ci: None,
-            our_nat_type_tcp: None,
-            our_nat_type_udp: None,
+            our_nat_info: Default::default(),
             p2p_el,
             display_available_peers: true,
             udp_hole_punchers,
@@ -300,17 +298,15 @@ impl Client {
     /// Probes NAT, detects UPnP support, and the user's OS.
     fn collect_details(&mut self) -> Result<(), Error> {
         info!("Detecting NAT type...");
-        let (_handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to detect our NAT type: {}", e);
-                panic!("Aborting due to the previous error");
-            }
+
+        let (nat_info, rendezvous_res) = match get_rendezvous_info(&self.p2p_el) {
+            (nat_info, Ok(_)) => (nat_info, Ok(())),
+            (nat_info, Err(e)) => (nat_info, Err(e)),
         };
 
-        let nat_type_tcp = our_ci.nat_type_for_tcp;
+        let nat_type_tcp = nat_info.nat_type_for_tcp.clone();
         info!("Detected NAT type for TCP {:?}", nat_type_tcp);
-        let nat_type_udp = our_ci.nat_type_for_udp;
+        let nat_type_udp = nat_info.nat_type_for_udp.clone();
         info!("Detected NAT type for UDP {:?}", nat_type_udp);
 
         let os_type = detect_os();
@@ -326,8 +322,7 @@ impl Client {
             }
         );
 
-        self.our_nat_type_tcp = Some(nat_type_tcp.clone());
-        self.our_nat_type_udp = Some(nat_type_udp.clone());
+        self.our_nat_info = nat_info;
 
         // Send the NAT type to the bootstrap proxy
         self.send_rpc(&Rpc::UpdateDetails(PeerDetails {
@@ -337,7 +332,13 @@ impl Client {
             os: os_type,
             upnp: upnp_support,
             version: GIT_COMMIT.to_owned(),
-        }))
+        }))?;
+
+        if let Err(err) = rendezvous_res {
+            rendezvous_error(err);
+        }
+
+        Ok(())
     }
 
     fn aggregate_stats(
@@ -446,8 +447,20 @@ impl Client {
                 let name = self.name.clone();
 
                 let (handle, mut our_ci) = match get_rendezvous_info(&self.p2p_el) {
-                    Ok(r) => r,
-                    Err(e) => {
+                    (nat_info, Ok(r)) => {
+                        if !is_nat_type_match(
+                            &nat_info.nat_type_for_tcp,
+                            &self.our_nat_info.nat_type_for_tcp,
+                        ) || !is_nat_type_match(
+                            &nat_info.nat_type_for_udp,
+                            &self.our_nat_info.nat_type_for_udp,
+                        ) {
+                            warn!("Changed NAT type: {:?}", nat_info);
+                            self.our_nat_info = nat_info;
+                        }
+                        r
+                    }
+                    (_, Err(e)) => {
                         error!("Failed to get our connection info: {}", e);
                         panic!("Aborting due to the previous error");
                     }
@@ -480,8 +493,20 @@ impl Client {
 
     fn await_peer(&mut self) -> Result<(), Error> {
         let (handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
-            Ok(r) => r,
-            Err(e) => {
+            (nat_info, Ok(r)) => {
+                if !is_nat_type_match(
+                    &nat_info.nat_type_for_tcp,
+                    &self.our_nat_info.nat_type_for_tcp,
+                ) || !is_nat_type_match(
+                    &nat_info.nat_type_for_udp,
+                    &self.our_nat_info.nat_type_for_udp,
+                ) {
+                    warn!("Changed NAT type: {:?}", nat_info);
+                    self.our_nat_info = nat_info;
+                }
+                r
+            }
+            (_, Err(e)) => {
                 error!("Failed to get our connection info: {}", e);
                 panic!("Aborting due to the previous error");
             }
@@ -495,6 +520,29 @@ impl Client {
 
         Ok(())
     }
+}
+
+fn is_nat_type_match(a: &P2pNatType, b: &P2pNatType) -> bool {
+    match (a, b) {
+        (P2pNatType::EDM(_), P2pNatType::EDM(_))
+        | (P2pNatType::EDMRandomIp(_), P2pNatType::EDMRandomIp(_))
+        | (P2pNatType::EDMRandomPort(_), P2pNatType::EDMRandomPort(_))
+        | (P2pNatType::EIM, P2pNatType::EIM) => true,
+        (_, _) => false,
+    }
+}
+
+fn rendezvous_error(error: NatError) -> ! {
+    error!(
+        "\n\nFailed to collect our connection information. Error description: {}\nPlease try again later and if the error persists please contact us and send the log file.\n\nPress Enter to continue...",
+        error
+    );
+
+    let stdin = io::stdin();
+    let mut readline = String::new();
+    unwrap!(stdin.lock().read_line(&mut readline));
+
+    std::process::exit(-1);
 }
 
 fn collect_conn_result(
@@ -684,15 +732,14 @@ fn detect_upnp() -> Result<bool, Error> {
     Ok(false)
 }
 
-fn get_rendezvous_info(el: &El) -> Res<(p2p::Handle, RendezvousInfo)> {
+fn get_rendezvous_info(el: &El) -> (NatInfo, Res<(p2p::Handle, RendezvousInfo)>) {
     let (tx, rx) = mpsc::channel();
     unwrap!(el.nat_tx.send(NatMsg::new(move |ifc, poll| {
-        let get_info = move |_: &mut Interface, _: &Poll, res| {
-            unwrap!(tx.send(res));
+        let get_info = move |_: &mut Interface, _: &Poll, nat_info, res| {
+            unwrap!(tx.send((nat_info, res)));
         };
         unwrap!(HolePunchMediator::start(ifc, poll, Box::new(get_info)));
     })));
-
     unwrap!(rx.recv())
 }
 
