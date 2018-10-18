@@ -224,7 +224,7 @@ impl Client {
         log_output.push_str(&format!(
             "\n===============================================\n{} with {}\n",
             if is_successful {
-                "Sucessfully connected"
+                "Successfully connected"
             } else {
                 "Failed to connect"
             },
