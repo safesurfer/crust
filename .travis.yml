@@ -23,3 +23,20 @@ script:
     cargo test --release --verbose
 before_cache:
   - cargo prune
+before_deploy:
+  - bash cargo_install.sh cargo-script 0.2.8
+  - mkdir -p target/deploy
+  - ./scripts/package.rs -c --name client -d target/deploy
+  # Set up git user name and tag this commit
+  - git config --local user.name "Nikita Baksalyar"
+  - git config --local user.email "nikita.baksalyar@maidsafe.net"
+  - git tag "$(date +'%Y%m%d%H%M%S')-$(git log --format=%h -1)"
+deploy:
+  provider: releases
+  api_key:
+    secure: "PLsdjZThgCLMySIxGOr5ej+Q8kklX0LPyVl3dLzgTrMUkqxULWYBTwsmfmk0d4lm0tRySFrvrVVArDBa5/wAPTt06YNEqjVTzipH4mXKplw4dmCF6E3aiiiUcXdWlDma8AwbMcJCgIQCFoIWkd7SGMQEac1xWRISIQanfYToRiXLoWwfj6DjicKISxHe15tkvC8B0Xlhumdi2TmdaxM9IrHi7/5csvCEB5dBDEW8eq2n5loEJzO4uDiuBtmpTHjS+bj3S4y2XwRs5WqkFaL4H6Voh7qrQ56il5Wh5NzpzIXxv6uCTVm8BJ1grMOLMm5rghr5N/tnlPJE3WHFz1zCZUkZG0bbJhINGPjnf/TIxGYh2iL21a3QZdjVTdIWlSewC72FbpFZHM130mg5LZ/9e1lMbjC0sz3swY6d5GYAd057sBLnlij1izCMd3SoJ9C0cssMIA2kPnYQGOp/c+MKyMR0baQ1a1xjYJ2c6xi92d9Kua8Gg/4b8C7sELSl/1WjINxWGq7DNy3hdtjwphvE1kJ8oHzn5CQWYijX2c9Jp9Q2rklNyrgHEnSDkw3w73DDYEm8vyYqvq32VSlAKl0fkfJhreUh2eAlUuSggGjyDYMH4S8zUz2sK/Dg/OydXsUGOW8Vhi3mEMDCZE3pOP0TdE3X0cIhQ6XB3l5n1mtCJZI="
+  file: target/deploy/*.zip
+  skip_cleanup: true
+  on:
+    tags: true
+after_deploy: rm -rf target/deploy
