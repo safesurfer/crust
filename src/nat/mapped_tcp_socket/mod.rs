@@ -35,13 +35,14 @@ pub struct MappedTcpSocket<F, UID> {
     stun_children: HashSet<Token>,
     mapped_addrs: Vec<SocketAddr>,
     timeout: Timeout,
+    igd_success: bool,
     finish: Option<F>,
     phantom: PhantomData<UID>,
 }
 
 impl<F, UID> MappedTcpSocket<F, UID>
 where
-    F: FnOnce(&mut Core, &Poll, TcpBuilder, Vec<SocketAddr>) + Any,
+    F: FnOnce(&mut Core, &Poll, TcpBuilder, Vec<SocketAddr>, bool) + Any,
     UID: Uid,
 {
     /// Start mapping a tcp socket
@@ -106,6 +107,7 @@ where
             igd_children,
             stun_children: HashSet::with_capacity(mc.peer_stuns().len()),
             mapped_addrs,
+            igd_success: false,
             timeout: core
                 .set_timeout(Duration::from_secs(TIMEOUT_SEC), CoreTimer::new(token, 0))?,
             finish: Some(finish),
@@ -156,6 +158,7 @@ where
 
     fn handle_igd_resp(&mut self, core: &mut Core, poll: &Poll, our_ext_addr: SocketAddr) {
         self.igd_children -= 1;
+        self.igd_success = true;
         self.mapped_addrs.push(our_ext_addr);
         if self.stun_children.is_empty() && self.igd_children == 0 {
             self.terminate(core, poll);
@@ -176,7 +179,7 @@ where
 
 impl<F, UID> State for MappedTcpSocket<F, UID>
 where
-    F: FnOnce(&mut Core, &Poll, TcpBuilder, Vec<SocketAddr>) + Any,
+    F: FnOnce(&mut Core, &Poll, TcpBuilder, Vec<SocketAddr>, bool) + Any,
     UID: Uid,
 {
     fn timeout(&mut self, core: &mut Core, poll: &Poll, _: u8) {
@@ -190,7 +193,8 @@ where
 
         let socket = unwrap!(self.socket.take());
         let mapped_addrs = self.mapped_addrs.drain(..).collect();
-        (unwrap!(self.finish.take()))(core, poll, socket, mapped_addrs);
+        let igd_success = self.igd_success;
+        (unwrap!(self.finish.take()))(core, poll, socket, mapped_addrs, igd_success);
     }
 
     fn as_any(&mut self) -> &mut Any {

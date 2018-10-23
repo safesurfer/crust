@@ -493,7 +493,7 @@ impl<UID: Uid> Service<UID> {
                     poll,
                     0,
                     &mc,
-                    move |_, _, socket, addrs| {
+                    move |_, _, socket, addrs, _| {
                         let hole_punch_addrs = addrs
                             .into_iter()
                             .filter(|elt| nat::ip_addr_is_global(&elt.ip()))

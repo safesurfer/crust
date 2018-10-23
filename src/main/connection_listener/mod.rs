@@ -56,41 +56,45 @@ impl<UID: Uid> ConnectionListener<UID> {
         event_tx: ::CrustEventSender<UID>,
     ) {
         let event_tx_0 = event_tx.clone();
-        let finish =
-            move |core: &mut Core, poll: &Poll, socket, mut mapped_addrs: Vec<SocketAddr>| {
-                let checker = |s: &SocketAddr| ip_addr_is_global(&s.ip()) && s.port() == port;
-                if force_include_port && port != 0 && !mapped_addrs.iter().any(checker) {
-                    let global_addrs: Vec<_> = mapped_addrs
-                        .iter()
-                        .filter_map(|s| {
-                            if ip_addr_is_global(&s.ip()) {
-                                let mut s = *s;
-                                s.set_port(port);
-                                Some(s)
-                            } else {
-                                None
-                            }
-                        }).collect();
-                    mapped_addrs.extend(global_addrs);
-                }
-                if let Err(e) = Self::handle_mapped_socket(
-                    core,
-                    poll,
-                    handshake_timeout_sec,
-                    socket,
-                    mapped_addrs,
-                    our_uid,
-                    name_hash,
-                    cm,
-                    config,
-                    our_listeners,
-                    token,
-                    event_tx.clone(),
-                ) {
-                    error!("TCP Listener failed to handle mapped socket: {:?}", e);
-                    let _ = event_tx.send(Event::ListenerFailed);
-                }
-            };
+        let finish = move |core: &mut Core,
+                           poll: &Poll,
+                           socket,
+                           mut mapped_addrs: Vec<SocketAddr>,
+                           igd_success| {
+            let checker = |s: &SocketAddr| ip_addr_is_global(&s.ip()) && s.port() == port;
+            if force_include_port && port != 0 && !mapped_addrs.iter().any(checker) {
+                let global_addrs: Vec<_> = mapped_addrs
+                    .iter()
+                    .filter_map(|s| {
+                        if ip_addr_is_global(&s.ip()) {
+                            let mut s = *s;
+                            s.set_port(port);
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    }).collect();
+                mapped_addrs.extend(global_addrs);
+            }
+            if let Err(e) = Self::handle_mapped_socket(
+                core,
+                poll,
+                handshake_timeout_sec,
+                socket,
+                mapped_addrs,
+                our_uid,
+                name_hash,
+                cm,
+                config,
+                our_listeners,
+                igd_success,
+                token,
+                event_tx.clone(),
+            ) {
+                error!("TCP Listener failed to handle mapped socket: {:?}", e);
+                let _ = event_tx.send(Event::ListenerFailed);
+            }
+        };
 
         if let Err(e) = MappedTcpSocket::<_, UID>::start(core, poll, port, &mc, finish) {
             error!("Error starting tcp_listening_socket: {:?}", e);
@@ -113,6 +117,7 @@ impl<UID: Uid> ConnectionListener<UID> {
         cm: ConnectionMap<UID>,
         config: CrustConfig,
         our_listeners: Arc<Mutex<Vec<SocketAddr>>>,
+        igd_success: bool,
         token: Token,
         event_tx: ::CrustEventSender<UID>,
     ) -> ::Res<()> {
@@ -142,7 +147,7 @@ impl<UID: Uid> ConnectionListener<UID> {
         };
 
         let _ = core.insert_state(token, Rc::new(RefCell::new(state)));
-        let _ = event_tx.send(Event::ListenerStarted(local_addr.port()));
+        let _ = event_tx.send(Event::ListenerStarted(local_addr.port(), igd_success));
 
         Ok(())
     }

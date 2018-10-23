@@ -66,7 +66,7 @@ impl<UID: Uid> PrivConnectionInfo<UID> {
 //                                     PubConnectionInfo
 // ========================================================================================
 /// Contact info used to connect to another peer.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PubConnectionInfo<UID> {
     #[doc(hidden)]
     pub id: UID,
