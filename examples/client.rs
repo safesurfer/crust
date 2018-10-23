@@ -52,7 +52,6 @@ use p2p::{
     Config, Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatInfo,
     NatMsg, NatType as P2pNatType, RendezvousInfo, TcpHolePunchInfo, UdpHolePunchInfo,
 };
-use rand::Rng;
 use rust_sodium::crypto::box_;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -119,6 +118,7 @@ enum Msg {
     RetryConnect,
     HolePunchResult(ConnId, Result<HolePunchStats, ()>),
     RendezvousInfoPrepared(NatInfo, Result<(P2pHandle, RendezvousInfo), NatError>, u32),
+    DisconnectPeer(Id),
 }
 
 impl fmt::Debug for Msg {
@@ -133,6 +133,7 @@ impl fmt::Debug for Msg {
                 "RendezvousInfoPrepared({:?}, ..., {})",
                 nat_info, res_token
             ),
+            Msg::DisconnectPeer(peer) => write!(f, "DisconnectPeer({:?})", peer),
         }
     }
 }
@@ -403,8 +404,6 @@ impl Client {
         let their_rendezvous_info = unwrap!(peer.their_rendezvous_info.take());
 
         // Attempt a direct connection
-        trace!("direct ci {:?}", their_direct_ci);
-
         self.id_to_conn_map
             .insert(unwrap!(peer.their_id.take()), conn_id);
         self.service
@@ -496,6 +495,11 @@ impl Client {
         Ok(())
     }
 
+    fn disconnect_peer(&self, peer_id: &Id) -> Result<(), Error> {
+        self.service.borrow().disconnect(peer_id);
+        Ok(())
+    }
+
     fn parse_direct_conn_result(&mut self, peer_id: &Id, is_successful: bool) -> Result<(), Error> {
         let conn_id = self
             .id_to_conn_map
@@ -506,7 +510,13 @@ impl Client {
         // let their_ip = self.service.borrow().get_peer_ip_addr(peer_id);
 
         if is_successful {
-            self.service.borrow().disconnect(peer_id);
+            let client_tx = self.client_tx.clone();
+            let peer_id = peer_id.clone();
+
+            thread::named("DirectConnDrop", move || {
+                sleep(Duration::from_secs(5));
+                unwrap!(client_tx.send(Msg::DisconnectPeer(peer_id)));
+            }).detach();
         }
 
         // Update the peer state
@@ -802,9 +812,9 @@ impl Client {
                         self.get_peer_name(their_id)
                     );
 
-                    let conn_id = self
+                    let conn_id = *self
                         .id_to_conn_map
-                        .remove(&self.our_id)
+                        .get(&self.our_id)
                         .ok_or(Error::ConnectionNotFound)?;
 
                     {
@@ -1125,6 +1135,7 @@ fn main() {
                         Msg::RendezvousInfoPrepared(nat_type, rendezvous_info, res_token) => {
                             client.set_rendezvous_info(res_token, rendezvous_info, nat_type)
                         }
+                        Msg::DisconnectPeer(peer_id) => client.disconnect_peer(&peer_id),
                     };
                     if let Err(e) = res {
                         error!("{}", e);
