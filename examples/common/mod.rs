@@ -19,7 +19,7 @@
 
 pub mod event_loop;
 
-use crust::Uid;
+use crust::{PubConnectionInfo, Uid};
 use p2p::{NatType as P2pNatType, RendezvousInfo};
 use rust_sodium::crypto::box_::PublicKey;
 use std::fmt;
@@ -100,6 +100,8 @@ impl<'a> From<&'a P2pNatType> for NatType {
 
 #[derive(Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]
 pub struct Peer {
+    pub id: [u8; 32],
+    pub name: Option<String>,
     pub ip: Ipv4Addr,
     pub nat_type: NatType,
     pub os: String,
@@ -110,6 +112,7 @@ pub struct LogUpdate {
     pub peer: PublicKey,
     pub udp_hole_punch_result: UdpNatTraversalResult,
     pub tcp_hole_punch_result: TcpNatTraversalResult,
+    pub is_direct_successful: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -136,8 +139,16 @@ impl PeerDetails {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Rpc {
     UpdateDetails(PeerDetails),
-    GetPeerReq(Option<String>, PublicKey, RendezvousInfo),
-    GetPeerResp(Option<String>, Option<(PublicKey, RendezvousInfo)>),
+    GetPeerReq(
+        Option<String>,
+        PublicKey,
+        RendezvousInfo,
+        PubConnectionInfo<Id>,
+    ),
+    GetPeerResp(
+        Option<String>,
+        Option<(PublicKey, RendezvousInfo, PubConnectionInfo<Id>)>,
+    ),
     UploadLog(LogUpdate),
     WrongVersion(String),
 }

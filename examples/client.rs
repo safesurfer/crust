@@ -20,9 +20,7 @@
 extern crate config_file_handler;
 extern crate crossbeam;
 extern crate crust;
-extern crate get_if_addrs;
 extern crate hex_fmt;
-extern crate igd;
 extern crate mio;
 #[macro_use]
 extern crate log;
@@ -42,9 +40,7 @@ mod common;
 use common::event_loop::{spawn_event_loop, El};
 use common::{Id, LogUpdate, Os, PeerDetails, Rpc, TcpNatTraversalResult, UdpNatTraversalResult};
 use crust::*;
-use get_if_addrs::IfAddr;
 use hex_fmt::HexFmt;
-use igd::PortMappingProtocol;
 use maidsafe_utilities::{
     event_sender::{EventSender, MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
@@ -54,7 +50,7 @@ use maidsafe_utilities::{
 use mio::Poll;
 use p2p::{
     Config, Handle as P2pHandle, HolePunchInfo, HolePunchMediator, Interface, NatError, NatInfo,
-    NatMsg, NatType as P2pNatType, RendezvousInfo, Res, TcpHolePunchInfo, UdpHolePunchInfo,
+    NatMsg, NatType as P2pNatType, RendezvousInfo, TcpHolePunchInfo, UdpHolePunchInfo,
 };
 use rand::Rng;
 use rust_sodium::crypto::box_;
@@ -64,19 +60,23 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::io::{self, BufRead, Write};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::mem;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::Duration;
 
 pub type PublicEncryptKey = box_::PublicKey;
+pub type ConnId = u32;
 
 const RETRY_DELAY: u64 = 10;
 const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
 
 #[derive(Debug)]
 pub enum Error {
+    PeerNotFound,
+    ConnectionNotFound,
     Crust(CrustError),
     Unexpected(String),
     Serialisation(SerialisationError),
@@ -115,10 +115,26 @@ impl From<String> for Error {
     }
 }
 
-#[derive(Debug)]
 enum Msg {
     RetryConnect,
-    ConnectedWithPeer(PublicEncryptKey, Result<FullConnStats, ()>, bool),
+    HolePunchResult(ConnId, Result<HolePunchStats, ()>),
+    RendezvousInfoPrepared(NatInfo, Result<(P2pHandle, RendezvousInfo), NatError>, u32),
+}
+
+impl fmt::Debug for Msg {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Msg::RetryConnect => write!(f, "RetryConnect"),
+            Msg::HolePunchResult(ref key, ref res) => {
+                write!(f, "HolePunchResult({}, {:?})", key, res)
+            }
+            Msg::RendezvousInfoPrepared(nat_info, _res, res_token) => write!(
+                f,
+                "RendezvousInfoPrepared({:?}, ..., {})",
+                nat_info, res_token
+            ),
+        }
+    }
 }
 
 /// Detects OS type
@@ -150,9 +166,40 @@ struct ConnAddr {
 }
 
 #[derive(Debug)]
-struct FullConnStats {
+struct HolePunchStats {
     tcp: Option<(ConnAddr, TcpNatTraversalResult)>,
     udp: Option<(ConnAddr, UdpNatTraversalResult)>,
+}
+
+/// Represents the current state of collected connection results.
+/// Once becomes `Both`, we send the log update to the proxy.
+enum ConnResults {
+    Empty,
+    HolePunch(Result<HolePunchStats, ()>),
+    Direct(bool),
+}
+
+struct PeerConnInfo {
+    our_direct_ci: Option<PrivConnectionInfo<Id>>,
+    our_rendezvous_info: Option<RendezvousInfo>,
+    their_direct_ci: Option<PubConnectionInfo<Id>>,
+    their_rendezvous_info: Option<RendezvousInfo>,
+    their_id: Option<PublicEncryptKey>,
+    handle: Option<P2pHandle>,
+}
+
+enum PeerState {
+    /// Gathering conn info
+    ConnectionInfo {
+        is_requester: bool,
+        ci: PeerConnInfo,
+    },
+    /// Attempting to connect
+    Connecting {
+        is_requester: bool,
+        their_id: PublicEncryptKey,
+        res: ConnResults,
+    },
 }
 
 struct Client {
@@ -163,14 +210,16 @@ struct Client {
     attempted_conns: Vec<PublicEncryptKey>,
     failed_conns: Vec<PublicEncryptKey>,
     our_id: PublicEncryptKey,
-    our_ci: Option<RendezvousInfo>,
     our_nat_info: NatInfo,
-    p2p_handle: Option<P2pHandle>,
     name: Option<String>,
+    id_to_conn_map: HashMap<PublicEncryptKey, ConnId>,
+    peer_states: HashMap<ConnId, PeerState>,
     peer_names: HashMap<PublicEncryptKey, String>,
     p2p_el: El,
     display_available_peers: bool,
-    udp_hole_punchers: Vec<u8>, // a vec of UdpHolePuncher::starting_ttl
+    /// A Vec of UdpHolePuncher::starting_ttl
+    udp_hole_punchers: Vec<u8>,
+    conn_id: u32,
 }
 
 impl Client {
@@ -188,29 +237,332 @@ impl Client {
             client_tx,
             name,
             proxy_id,
-            p2p_handle: None,
+            peer_states: Default::default(),
             peer_names: Default::default(),
+            id_to_conn_map: Default::default(),
             service: Rc::new(RefCell::new(service)),
             successful_conns: Vec::new(),
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
-            our_ci: None,
             our_nat_info: Default::default(),
             p2p_el,
             display_available_peers: true,
             udp_hole_punchers,
+            conn_id: 0,
         }
+    }
+
+    fn set_rendezvous_info(
+        &mut self,
+        conn_id: ConnId,
+        conn_info: Result<(P2pHandle, RendezvousInfo), NatError>,
+        nat_info: NatInfo,
+    ) -> Result<(), Error> {
+        let (handle, conn_info) = match (nat_info, conn_info) {
+            (nat_info, Ok(res)) => {
+                if !is_nat_type_match(
+                    &nat_info.nat_type_for_tcp,
+                    &self.our_nat_info.nat_type_for_tcp,
+                ) || !is_nat_type_match(
+                    &nat_info.nat_type_for_udp,
+                    &self.our_nat_info.nat_type_for_udp,
+                ) {
+                    warn!("Changed NAT type: {:?}", nat_info);
+                    self.our_nat_info = nat_info;
+                }
+                res
+            }
+            (_, Err(e)) => {
+                error!("Failed to get our connection info: {}", e);
+                panic!("Aborting due to the previous error");
+            }
+        };
+
+        let (should_connect, is_requester) = {
+            let peer_state = self
+                .peer_states
+                .get_mut(&conn_id)
+                .ok_or(Error::PeerNotFound)?;
+
+            if let PeerState::ConnectionInfo {
+                is_requester,
+                ref mut ci,
+            } = peer_state
+            {
+                (*ci).handle = Some(handle);
+                (*ci).our_rendezvous_info = Some(conn_info);
+
+                (ci.our_direct_ci.is_some(), *is_requester)
+            } else {
+                unreachable!("Invalid peer state");
+            }
+        };
+
+        if should_connect {
+            self.start_connect(conn_id, is_requester)?;
+        }
+
+        Ok(())
+    }
+
+    fn start_connect(&mut self, conn_id: ConnId, is_requester: bool) -> Result<(), Error> {
+        if !is_requester {
+            self.connect(conn_id)?;
+        } else {
+            let rpc = {
+                let peer_state = self.peer_states.get(&conn_id).ok_or(Error::PeerNotFound)?;
+
+                if let PeerState::ConnectionInfo { ci, .. } = peer_state {
+                    Rpc::GetPeerReq(
+                        self.name.clone(),
+                        self.our_id,
+                        unwrap!(ci.our_rendezvous_info.clone()),
+                        unwrap!(
+                            ci.our_direct_ci
+                                .as_ref()
+                                .map(|c| c.to_pub_connection_info())
+                        ),
+                    )
+                } else {
+                    unreachable!("Invalid peer state");
+                }
+            };
+
+            self.send_rpc(&rpc)?;
+        }
+
+        Ok(())
+    }
+
+    fn set_direct_conn_info(&mut self, conn_info: ConnectionInfoResult<Id>) -> Result<(), Error> {
+        let conn_id = conn_info.result_token;
+
+        let (should_connect, is_requester) = {
+            let peer_state = self
+                .peer_states
+                .get_mut(&conn_id)
+                .ok_or(Error::PeerNotFound)?;
+
+            if let PeerState::ConnectionInfo {
+                is_requester,
+                ref mut ci,
+            } = peer_state
+            {
+                (*ci).our_direct_ci = Some(conn_info.result?);
+
+                (ci.our_rendezvous_info.is_some(), *is_requester)
+            } else {
+                unreachable!("Invalid peer state");
+            }
+        };
+
+        if should_connect {
+            self.start_connect(conn_id, is_requester)?;
+        }
+
+        Ok(())
+    }
+
+    fn connect(&mut self, conn_id: ConnId) -> Result<(), Error> {
+        let (mut peer, is_requester) = {
+            let peer_state = self
+                .peer_states
+                .get_mut(&conn_id)
+                .and_then(|peer| {
+                    let (is_requester, their_id) =
+                        if let PeerState::ConnectionInfo { is_requester, ci } = peer {
+                            (*is_requester, ci.their_id.clone())
+                        } else {
+                            unreachable!("Invalid peer state");
+                        };
+                    Some(mem::replace(
+                        peer,
+                        PeerState::Connecting {
+                            is_requester,
+                            their_id: unwrap!(their_id),
+                            res: ConnResults::Empty,
+                        },
+                    ))
+                }).ok_or(Error::PeerNotFound)?;
+
+            if let PeerState::ConnectionInfo { ci, is_requester } = peer_state {
+                (ci, is_requester)
+            } else {
+                unreachable!("Invalid peer state");
+            }
+        };
+
+        let udp_hp = self.udp_hole_punchers.clone();
+        let client_tx = self.client_tx.clone();
+
+        let handle = unwrap!(peer.handle.take());
+        let our_p2p_ci = unwrap!(peer.our_rendezvous_info.take());
+        let our_direct_ci = unwrap!(peer.our_direct_ci.take());
+        let our_pub_direct_ci = our_direct_ci.to_pub_connection_info();
+        let their_direct_ci = unwrap!(peer.their_direct_ci.take());
+        let their_rendezvous_info = unwrap!(peer.their_rendezvous_info.take());
+
+        // Attempt a direct connection
+        trace!("direct ci {:?}", their_direct_ci);
+
+        self.id_to_conn_map
+            .insert(unwrap!(peer.their_id.take()), conn_id);
+        self.service
+            .borrow()
+            .connect(our_direct_ci, their_direct_ci)?;
+
+        // Attempt hole punching
+        if !is_requester {
+            let our_p2p_ci2 = our_p2p_ci.clone();
+
+            handle.fire_hole_punch(
+                their_rendezvous_info,
+                Box::new(move |_, _, res| {
+                    // Hole punch result
+                    let hole_punch_stats = collect_hole_punch_result(&our_p2p_ci2, res, &udp_hp);
+                    unwrap!(client_tx.send(Msg::HolePunchResult(conn_id, hole_punch_stats)));
+                }),
+            );
+
+            self.send_rpc(&Rpc::GetPeerResp(
+                self.name.clone(),
+                Some((self.our_id, our_p2p_ci, our_pub_direct_ci)),
+            ))?;
+        } else {
+            // Attempt hole punching
+            handle.fire_hole_punch(
+                their_rendezvous_info,
+                Box::new(move |_, _, res| {
+                    // Hole punch result
+                    let hole_punch_stats = collect_hole_punch_result(&our_p2p_ci, res, &udp_hp);
+                    unwrap!(client_tx.send(Msg::HolePunchResult(conn_id, hole_punch_stats)));
+                    unwrap!(client_tx.send(Msg::RetryConnect));
+                }),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn parse_hole_punch_result(
+        &mut self,
+        conn_id: ConnId,
+        hole_punch_stats: Result<HolePunchStats, ()>,
+    ) -> Result<(), Error> {
+        // Update the peer state
+        let (old_state, is_requester, their_id) = {
+            let peer_state = self
+                .peer_states
+                .get_mut(&conn_id)
+                .ok_or(Error::PeerNotFound)?;
+
+            if let PeerState::Connecting {
+                ref mut res,
+                is_requester,
+                their_id,
+            } = peer_state
+            {
+                let old_state = mem::replace(res, ConnResults::Empty);
+                (old_state, *is_requester, *their_id)
+            } else {
+                unreachable!("Invalid peer state");
+            }
+        };
+
+        match old_state {
+            ConnResults::Empty => {
+                let mut peer_state = self
+                    .peer_states
+                    .get_mut(&conn_id)
+                    .ok_or(Error::PeerNotFound)?;
+
+                if let PeerState::Connecting { ref mut res, .. } = peer_state {
+                    *res = ConnResults::HolePunch(hole_punch_stats);
+                }
+            }
+            ConnResults::Direct(direct_conn_res) => {
+                self.report_connection_result(
+                    their_id,
+                    hole_punch_stats,
+                    direct_conn_res,
+                    is_requester,
+                )?;
+            }
+            ConnResults::HolePunch(..) => {
+                unreachable!("Invalid state");
+            }
+        };
+
+        Ok(())
+    }
+
+    fn parse_direct_conn_result(&mut self, peer_id: &Id, is_successful: bool) -> Result<(), Error> {
+        let conn_id = self
+            .id_to_conn_map
+            .remove(&peer_id.0)
+            .ok_or(Error::ConnectionNotFound)?;
+
+        // let our_ip = self.direct_ip;
+        // let their_ip = self.service.borrow().get_peer_ip_addr(peer_id);
+
+        if is_successful {
+            self.service.borrow().disconnect(peer_id);
+        }
+
+        // Update the peer state
+        let (old_state, is_requester, their_id) = {
+            let peer_state = self
+                .peer_states
+                .get_mut(&conn_id)
+                .ok_or(Error::PeerNotFound)?;
+
+            if let PeerState::Connecting {
+                ref mut res,
+                is_requester,
+                their_id,
+            } = peer_state
+            {
+                let old_state = mem::replace(res, ConnResults::Empty);
+                (old_state, *is_requester, *their_id)
+            } else {
+                unreachable!("Invalid peer state");
+            }
+        };
+
+        match old_state {
+            ConnResults::Empty => {
+                if let PeerState::Connecting { ref mut res, .. } = self
+                    .peer_states
+                    .get_mut(&conn_id)
+                    .ok_or(Error::PeerNotFound)?
+                {
+                    *res = ConnResults::Direct(is_successful);
+                } else {
+                    unreachable!("Invalid peer state");
+                }
+            }
+            ConnResults::HolePunch(hp_res) => {
+                self.report_connection_result(their_id, hp_res, is_successful, is_requester)?;
+            }
+            ConnResults::Direct(..) => {
+                unreachable!("Invalid state");
+            }
+        }
+
+        Ok(())
     }
 
     fn report_connection_result(
         &mut self,
         peer_id: PublicEncryptKey,
-        conn_res: Result<FullConnStats, ()>,
+        hole_punch_result: Result<HolePunchStats, ()>,
+        is_direct_successful: bool,
         send_stats: bool,
     ) -> Result<(), Error> {
         self.display_available_peers = true;
 
-        let is_successful = conn_res.is_ok();
+        let is_hole_punch_successful = hole_punch_result.is_ok();
+        let is_successful = is_hole_punch_successful || is_direct_successful;
 
         if is_successful {
             self.successful_conns.push(peer_id);
@@ -231,7 +583,7 @@ impl Client {
             self.get_peer_name(peer_id),
         ));
 
-        if let Ok(FullConnStats { ref tcp, .. }) = conn_res {
+        if let Ok(HolePunchStats { ref tcp, .. }) = hole_punch_result {
             log_output.push_str(&format!(
                 "TCP result: {}\n",
                 if let Some((tcp, TcpNatTraversalResult::Succeeded { time_spent })) = tcp {
@@ -244,7 +596,7 @@ impl Client {
                 }
             ));
         }
-        if let Ok(FullConnStats { ref udp, .. }) = conn_res {
+        if let Ok(HolePunchStats { ref udp, .. }) = hole_punch_result {
             log_output.push_str(&format!(
                 "UDP result: {}\n",
                 if let Some((udp, UdpNatTraversalResult::Succeeded { time_spent, .. })) = udp {
@@ -257,6 +609,15 @@ impl Client {
                 }
             ));
         }
+
+        log_output.push_str(&format!(
+            "Direct connection result: {}\n",
+            if is_direct_successful {
+                format!("local (us) <-> local (them)")
+            } else {
+                "Failed".to_owned()
+            }
+        ));
 
         log_output.push_str(&format!(
             "Successful connections: {:?}\n",
@@ -286,7 +647,7 @@ impl Client {
 
         // Send stats only if the requester is us
         if send_stats {
-            let log_upd = self.aggregate_stats(peer_id, conn_res);
+            let log_upd = self.aggregate_stats(peer_id, hole_punch_result, is_direct_successful);
             trace!("Sending stats");
             trace!("{:?}", log_upd);
             self.send_rpc(&Rpc::UploadLog(log_upd))?;
@@ -295,24 +656,27 @@ impl Client {
         Ok(())
     }
 
-    /// Probes NAT, detects UPnP support, and the user's OS.
-    fn collect_details(&mut self) -> Result<(), Error> {
+    /// Probes NAT and detects the user's OS.
+    fn collect_details(&mut self, upnp_support: bool) -> Result<(), Error> {
         info!("Detecting NAT type...");
 
-        let (nat_info, rendezvous_res) = match get_rendezvous_info(&self.p2p_el) {
-            (nat_info, Ok(_)) => (nat_info, Ok(())),
-            (nat_info, Err(e)) => (nat_info, Err(e)),
-        };
+        // let (nat_info, rendezvous_res) = match get_rendezvous_info(&self.p2p_el) {
+        //     (nat_info, Ok(_)) => (nat_info, Ok(())),
+        //     (nat_info, Err(e)) => (nat_info, Err(e)),
+        // };
 
-        let nat_type_tcp = nat_info.nat_type_for_tcp.clone();
+        // let nat_type_tcp = nat_info.nat_type_for_tcp.clone();
+        // let nat_type_udp = nat_info.nat_type_for_udp.clone();
+
+        let nat_type_tcp = P2pNatType::EIM;
+        let nat_type_udp = P2pNatType::EIM;
+
         info!("Detected NAT type for TCP {:?}", nat_type_tcp);
-        let nat_type_udp = nat_info.nat_type_for_udp.clone();
         info!("Detected NAT type for UDP {:?}", nat_type_udp);
 
         let os_type = detect_os();
         info!("Detected OS type: {:?}", os_type);
 
-        let upnp_support = detect_upnp()?;
         info!(
             "{}",
             if upnp_support {
@@ -322,7 +686,7 @@ impl Client {
             }
         );
 
-        self.our_nat_info = nat_info;
+        // self.our_nat_info = nat_info;
 
         // Send the NAT type to the bootstrap proxy
         self.send_rpc(&Rpc::UpdateDetails(PeerDetails {
@@ -334,9 +698,9 @@ impl Client {
             version: GIT_COMMIT.to_owned(),
         }))?;
 
-        if let Err(err) = rendezvous_res {
-            rendezvous_error(err);
-        }
+        // if let Err(err) = rendezvous_res {
+        //     rendezvous_error(err);
+        // }
 
         Ok(())
     }
@@ -344,12 +708,13 @@ impl Client {
     fn aggregate_stats(
         &self,
         peer: PublicEncryptKey,
-        conn_res: Result<FullConnStats, ()>,
+        hole_punch_result: Result<HolePunchStats, ()>,
+        is_direct_successful: bool,
     ) -> LogUpdate {
         let mut tcp_hole_punch_result = TcpNatTraversalResult::Failed;
         let mut udp_hole_punch_result = UdpNatTraversalResult::Failed;
 
-        if let Ok(res) = conn_res {
+        if let Ok(res) = hole_punch_result {
             if let Some((_, tcp_traversal_result)) = res.tcp {
                 tcp_hole_punch_result = tcp_traversal_result;
             }
@@ -362,6 +727,7 @@ impl Client {
             peer,
             udp_hole_punch_result,
             tcp_hole_punch_result,
+            is_direct_successful,
         }
     }
 
@@ -380,6 +746,39 @@ impl Client {
         }
     }
 
+    /// Collects both rendezvous + Crust direct connection info
+    fn initiate_connection(
+        &mut self,
+        their_id: Option<PublicEncryptKey>,
+        their_rendezvous_info: Option<RendezvousInfo>,
+        their_direct_ci: Option<PubConnectionInfo<Id>>,
+        is_requester: bool,
+    ) -> ConnId {
+        let res_token = self.conn_id;
+
+        self.service.borrow().prepare_connection_info(res_token);
+        get_rendezvous_info(&self.p2p_el, self.client_tx.clone(), res_token);
+
+        self.peer_states.insert(
+            self.conn_id,
+            PeerState::ConnectionInfo {
+                is_requester,
+                ci: PeerConnInfo {
+                    our_direct_ci: None,
+                    our_rendezvous_info: None,
+                    handle: None,
+                    their_id,
+                    their_rendezvous_info,
+                    their_direct_ci,
+                },
+            },
+        );
+
+        self.conn_id += 1;
+
+        res_token
+    }
+
     fn handle_new_message(&mut self, rpc_cmd: Rpc) -> Result<(), Error> {
         trace!("Received {}", rpc_cmd);
 
@@ -392,7 +791,7 @@ impl Client {
                 );
             }
             Rpc::GetPeerResp(name, ci_opt) => {
-                if let Some((their_id, ci)) = ci_opt {
+                if let Some((their_id, rendezvous_info, direct_ci)) = ci_opt {
                     // Attempt to connect with peer
                     self.attempted_conns.push(their_id);
                     if let Some(name) = name {
@@ -403,21 +802,26 @@ impl Client {
                         self.get_peer_name(their_id)
                     );
 
-                    let client_tx = self.client_tx.clone();
-                    let our_ci = unwrap!(self.our_ci.take());
-                    let udp_hp = self.udp_hole_punchers.clone();
+                    let conn_id = self
+                        .id_to_conn_map
+                        .remove(&self.our_id)
+                        .ok_or(Error::ConnectionNotFound)?;
 
-                    unwrap!(self.p2p_handle.take()).fire_hole_punch(
-                        ci,
-                        Box::new(move |_, _, res| {
-                            // Hole punch result
-                            let full_stats = collect_conn_result(&our_ci, res, &udp_hp);
-                            unwrap!(
-                                client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, true))
-                            );
-                            unwrap!(client_tx.send(Msg::RetryConnect));
-                        }),
-                    );
+                    {
+                        let mut ci = self
+                            .peer_states
+                            .get_mut(&conn_id)
+                            .ok_or(Error::PeerNotFound)?;
+                        if let PeerState::ConnectionInfo { ref mut ci, .. } = ci {
+                            (*ci).their_rendezvous_info = Some(rendezvous_info);
+                            (*ci).their_direct_ci = Some(direct_ci);
+                            (*ci).their_id = Some(their_id);
+                        } else {
+                            unreachable!("Invalid peer state");
+                        }
+                    }
+
+                    self.connect(conn_id)?;
                 } else {
                     // Retry again in some time
                     if self.display_available_peers {
@@ -431,7 +835,7 @@ impl Client {
                     retry_connection(&self.client_tx);
                 }
             }
-            Rpc::GetPeerReq(name, their_id, their_ci) => {
+            Rpc::GetPeerReq(name, their_id, their_rendezvous_ci, their_direct_ci) => {
                 // Someone requested a direct connection with us
                 if let Some(name) = name {
                     self.peer_names.insert(their_id, name.clone());
@@ -443,45 +847,12 @@ impl Client {
                     self.get_peer_name(their_id)
                 );
 
-                let client_tx = self.client_tx.clone();;
-                let name = self.name.clone();
-
-                let (handle, mut our_ci) = match get_rendezvous_info(&self.p2p_el) {
-                    (nat_info, Ok(r)) => {
-                        if !is_nat_type_match(
-                            &nat_info.nat_type_for_tcp,
-                            &self.our_nat_info.nat_type_for_tcp,
-                        ) || !is_nat_type_match(
-                            &nat_info.nat_type_for_udp,
-                            &self.our_nat_info.nat_type_for_udp,
-                        ) {
-                            warn!("Changed NAT type: {:?}", nat_info);
-                            self.our_nat_info = nat_info;
-                        }
-                        r
-                    }
-                    (_, Err(e)) => {
-                        error!("Failed to get our connection info: {}", e);
-                        panic!("Aborting due to the previous error");
-                    }
-                };
-                trace!("Our responder CI: {:?}", our_ci);
-
-                let our_ci2 = our_ci.clone();
-                let udp_hp = self.udp_hole_punchers.clone();
-
-                handle.fire_hole_punch(
-                    their_ci,
-                    Box::new(move |_, _, res| {
-                        // Hole punch result
-                        let full_stats = collect_conn_result(&our_ci2, res, &udp_hp);
-                        unwrap!(
-                            client_tx.send(Msg::ConnectedWithPeer(their_id, full_stats, false))
-                        );
-                    }),
+                self.initiate_connection(
+                    Some(their_id),
+                    Some(their_rendezvous_ci),
+                    Some(their_direct_ci),
+                    false,
                 );
-
-                self.send_rpc(&Rpc::GetPeerResp(name, Some((self.our_id, our_ci))))?;
             }
             _ => {
                 error!("Invalid command from the proxy");
@@ -492,31 +863,8 @@ impl Client {
     }
 
     fn await_peer(&mut self) -> Result<(), Error> {
-        let (handle, our_ci) = match get_rendezvous_info(&self.p2p_el) {
-            (nat_info, Ok(r)) => {
-                if !is_nat_type_match(
-                    &nat_info.nat_type_for_tcp,
-                    &self.our_nat_info.nat_type_for_tcp,
-                ) || !is_nat_type_match(
-                    &nat_info.nat_type_for_udp,
-                    &self.our_nat_info.nat_type_for_udp,
-                ) {
-                    warn!("Changed NAT type: {:?}", nat_info);
-                    self.our_nat_info = nat_info;
-                }
-                r
-            }
-            (_, Err(e)) => {
-                error!("Failed to get our connection info: {}", e);
-                panic!("Aborting due to the previous error");
-            }
-        };
-        trace!("Our requester CI: {:?}", our_ci);
-
-        self.p2p_handle = Some(handle);
-        self.our_ci = Some(our_ci.clone());
-
-        self.send_rpc(&Rpc::GetPeerReq(self.name.clone(), self.our_id, our_ci))?;
+        let conn_id = self.initiate_connection(None, None, None, true);
+        self.id_to_conn_map.insert(self.our_id.clone(), conn_id);
 
         Ok(())
     }
@@ -545,11 +893,11 @@ fn rendezvous_error(error: NatError) -> ! {
     std::process::exit(-1);
 }
 
-fn collect_conn_result(
-    our_ci: &RendezvousInfo,
+fn collect_hole_punch_result(
+    our_p2p_ci: &RendezvousInfo,
     conn_res: Result<HolePunchInfo, NatError>,
     udp_hole_punchers: &Vec<u8>,
-) -> Result<FullConnStats, ()> {
+) -> Result<HolePunchStats, ()> {
     let HolePunchInfo { tcp, udp, .. } = match conn_res {
         Ok(conn_info) => conn_info,
         Err(_e) => {
@@ -574,7 +922,7 @@ fn collect_conn_result(
 
             Some((
                 ConnAddr {
-                    our: unwrap!(our_ci.tcp),
+                    our: unwrap!(our_p2p_ci.tcp),
                     their: peer_addr,
                 },
                 TcpNatTraversalResult::Succeeded { time_spent: dur },
@@ -606,7 +954,7 @@ fn collect_conn_result(
             .enumerate()
             .find(|(_, puncher_starting_ttl)| **puncher_starting_ttl == starting_ttl as u8)
         {
-            let our_external_addr = our_ci.udp.get(hole_puncher_idx);
+            let our_external_addr = our_p2p_ci.udp.get(hole_puncher_idx);
 
             if let Some(our) = our_external_addr {
                 Some((
@@ -638,7 +986,7 @@ fn collect_conn_result(
         None
     };
 
-    Ok(FullConnStats { tcp, udp })
+    Ok(HolePunchStats { tcp, udp })
 }
 
 fn get_user_name() -> Option<String> {
@@ -657,90 +1005,13 @@ fn get_user_name() -> Option<String> {
     }
 }
 
-fn detect_upnp() -> Result<bool, Error> {
-    // Detect our interfaces
-    info!("Detecting UPnP support...");
-
-    let ifs = get_if_addrs::get_if_addrs()?;
-    let mut ifv4s = Vec::with_capacity(5);
-    for interface in ifs {
-        match interface.addr {
-            IfAddr::V4(v4_addr) => ifv4s.push((v4_addr.ip, None)),
-            _ => (),
-        }
-    }
-
-    crossbeam::scope(|scope| {
-        let mut guards = Vec::with_capacity(ifv4s.len());
-
-        for ifv4 in &mut ifv4s {
-            if !ifv4.0.is_loopback() {
-                guards.push(scope.spawn(move || {
-                    debug!("Searching gateway {:?}", ifv4.0);
-                    ifv4.1 = igd::search_gateway_from_timeout(ifv4.0, Duration::from_secs(1)).ok();
-                }));
-            }
-        }
-    });
-
-    let port = rand::thread_rng().gen_range(10000, std::u16::MAX);
-
-    // Ask IGD
-    let (tx, rx) = mpsc::channel();
-    let igd_children = {
-        let mut igd_children = vec![];
-        debug!("Interfaces: {:?}", ifv4s);
-
-        for (ref ip, ref gateway) in ifv4s {
-            let gateway = match *gateway {
-                Some(ref gateway) => gateway.clone(),
-                None => continue,
-            };
-
-            let addr_igd = SocketAddrV4::new(*ip, port);
-            let tx2 = tx.clone();
-
-            igd_children.push(thread::named("IGD-Address-Mapping", move || {
-                debug!("Getting any address for {:?}", addr_igd);
-                let res =
-                    gateway.get_any_address(PortMappingProtocol::TCP, addr_igd, 10, "MaidSafeNat");
-                let ext_addr = match res {
-                    Ok(ext_addr) => Some(ext_addr),
-                    Err(e) => {
-                        debug!("IGD error: {}", e);
-                        None
-                    }
-                };
-                unwrap!(tx2.send(ext_addr));
-            }));
-        }
-
-        igd_children.len()
-    };
-
-    drop(tx);
-
-    if igd_children > 0 {
-        debug!("Waiting for {} IGD scanners", igd_children);
-        while let Ok(ext_addr) = rx.recv() {
-            if let Some(_) = ext_addr {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-fn get_rendezvous_info(el: &El) -> (NatInfo, Res<(p2p::Handle, RendezvousInfo)>) {
-    let (tx, rx) = mpsc::channel();
+fn get_rendezvous_info(el: &El, tx: EventSender<MaidSafeEventCategory, Msg>, res_token: u32) {
     unwrap!(el.nat_tx.send(NatMsg::new(move |ifc, poll| {
         let get_info = move |_: &mut Interface, _: &Poll, nat_info, res| {
-            unwrap!(tx.send((nat_info, res)));
+            unwrap!(tx.send(Msg::RendezvousInfoPrepared(nat_info, res, res_token)));
         };
         unwrap!(HolePunchMediator::start(ifc, poll, Box::new(get_info)));
     })));
-    unwrap!(rx.recv())
 }
 
 fn main() {
@@ -804,6 +1075,18 @@ fn main() {
 
     info!("Connected to {:<8} ({})", HexFmt(proxy_id.0), proxy_addr);
 
+    unwrap!(svc.start_listening_tcp());
+
+    if let MaidSafeEventCategory::Crust = unwrap!(category_rx.recv()) {
+    } else {
+        unreachable!("Unexpected category");
+    };
+    let igd_status = if let Event::ListenerStarted(_port, igd_status) = unwrap!(crust_rx.recv()) {
+        (igd_status)
+    } else {
+        panic!("Could not start TCP listeners");
+    };
+
     let mut client = Client::new(
         our_pk,
         proxy_id,
@@ -815,7 +1098,7 @@ fn main() {
     );
 
     // Probe NAT type
-    unwrap!(client.collect_details());
+    unwrap!(client.collect_details(igd_status));
 
     // Find our connection info and wait for peer
     match client.await_peer() {
@@ -836,8 +1119,11 @@ fn main() {
                 Ok(msg) => {
                     let res = match msg {
                         Msg::RetryConnect => client.await_peer(),
-                        Msg::ConnectedWithPeer(peer_id, full_stats, send_stats) => {
-                            client.report_connection_result(peer_id, full_stats, send_stats)
+                        Msg::HolePunchResult(conn_id, hole_punch_stats) => {
+                            client.parse_hole_punch_result(conn_id, hole_punch_stats)
+                        }
+                        Msg::RendezvousInfoPrepared(nat_type, rendezvous_info, res_token) => {
+                            client.set_rendezvous_info(res_token, rendezvous_info, nat_type)
                         }
                     };
                     if let Err(e) = res {
@@ -846,6 +1132,15 @@ fn main() {
                 }
             },
             Ok(MaidSafeEventCategory::Crust) => match crust_rx.try_recv() {
+                Ok(Event::ConnectionInfoPrepared(conn_info)) => {
+                    unwrap!(client.set_direct_conn_info(conn_info));
+                }
+                Ok(Event::ConnectSuccess(peer_id)) => {
+                    unwrap!(client.parse_direct_conn_result(&peer_id, true));
+                }
+                Ok(Event::ConnectFailure(peer_id)) => {
+                    unwrap!(client.parse_direct_conn_result(&peer_id, false));
+                }
                 Ok(Event::NewMessage(peer_id, _user, data)) => {
                     if peer_id != proxy_id {
                         warn!("Unknown peer: {:<8}", HexFmt(peer_id.0));
@@ -854,9 +1149,11 @@ fn main() {
                     let rpc: Rpc = unwrap!(deserialise(&data));
                     unwrap!(client.handle_new_message(rpc));
                 }
-                Ok(Event::LostPeer(_)) => {
-                    info!("Disconnected from the proxy");
-                    break;
+                Ok(Event::LostPeer(peer_id)) => {
+                    if peer_id == proxy_id {
+                        info!("Disconnected from the proxy");
+                        break;
+                    }
                 }
                 Ok(event) => {
                     trace!("Unexpected event {:?}", event);

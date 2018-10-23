@@ -41,7 +41,6 @@ use maidsafe_utilities::{
     event_sender::{MaidSafeEventCategory, MaidSafeObserver},
     log as logger,
     serialisation::{deserialise, serialise},
-    thread,
 };
 use p2p::RendezvousInfo;
 use rand::Rng;
@@ -49,29 +48,14 @@ use rust_sodium::crypto::box_;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
+use std::io;
 use std::net::IpAddr;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::mpsc;
 
 type PublicEncryptKey = box_::PublicKey;
 
 const GIT_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/git_commit_hash"));
-
-#[derive(Debug, Default)]
-struct StatPairs {
-    tcp_failures: u64,
-    tcp_succ: u64,
-    udp_failures: u64,
-    udp_succ: u64,
-}
-
-#[derive(Debug, Default)]
-struct QuickStats {
-    no_hairpin: StatPairs,
-    hairpin: StatPairs,
-}
 
 mod stats {
     use serde_json;
@@ -87,6 +71,7 @@ mod stats {
 #[derive(Debug)]
 pub enum Error {
     Crust(CrustError),
+    Io(io::Error),
     Unexpected(String),
     PartialPeerInfo,
     WrongPeerPairing(PublicEncryptKey, PublicEncryptKey),
@@ -105,6 +90,12 @@ impl ::std::error::Error for Error {}
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         Error::Unexpected(format!("Serialisation error: {}", err))
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err)
     }
 }
 
@@ -134,6 +125,7 @@ pub struct LogEntry {
     peer_responder: common::Peer,
     udp_hole_punch_result: NatTraversalResult,
     tcp_hole_punch_result: NatTraversalResult,
+    is_direct_successful: bool,
 }
 
 #[derive(Eq, PartialEq, Hash, Debug)]
@@ -145,7 +137,8 @@ enum PeerStatus {
 struct ConnectedPeer {
     id: PublicEncryptKey,
     addr: IpAddr,
-    conn_info: Option<RendezvousInfo>,
+    p2p_conn_info: Option<RendezvousInfo>,
+    direct_conn_info: Option<PubConnectionInfo<Id>>,
     details: Option<PeerDetails>,
     peers_known: HashMap<PublicEncryptKey, PeerStatus>,
 }
@@ -157,22 +150,31 @@ impl ConnectedPeer {
             addr,
             details: None,
             peers_known: HashMap::default(),
-            conn_info: None,
+            p2p_conn_info: None,
+            direct_conn_info: None,
         }
+    }
+
+    fn get_details<R, F>(&self, details_map: F) -> Result<R, Error>
+    where
+        F: Fn(&PeerDetails) -> R,
+    {
+        self.details
+            .as_ref()
+            .map(details_map)
+            .ok_or(Error::PartialPeerInfo)
     }
 }
 
 struct Proxy {
     peers: HashMap<PublicEncryptKey, ConnectedPeer>,
     service: Rc<RefCell<Service<Id>>>,
-    stats_mutex: Arc<Mutex<QuickStats>>,
 }
 
 impl Proxy {
-    fn new(service: Rc<RefCell<Service<Id>>>, stats_mutex: Arc<Mutex<QuickStats>>) -> Self {
+    fn new(service: Rc<RefCell<Service<Id>>>) -> Self {
         Proxy {
             service,
-            stats_mutex,
             peers: Default::default(),
         }
     }
@@ -241,14 +243,19 @@ impl Proxy {
         found_peer: Option<PublicEncryptKey>,
     ) -> Result<(), Error> {
         if let Some(new_pair) = found_peer {
-            let conn_info = {
+            let (p2p_conn_info, direct_conn_info) = {
                 let requester = self.get_peer_mut(&requester_id)?;
                 requester.peers_known.insert(new_pair, PeerStatus::Pending);
-                requester
-                    .conn_info
-                    .as_ref()
-                    .ok_or_else(|| Error::PeerNotFound(requester_id.clone()))?
-                    .clone()
+                (
+                    requester
+                        .p2p_conn_info
+                        .clone()
+                        .ok_or_else(|| Error::PeerNotFound(requester_id.clone()))?,
+                    requester
+                        .direct_conn_info
+                        .clone()
+                        .ok_or_else(|| Error::PeerNotFound(requester_id.clone()))?,
+                )
             };
             let requester_name = {
                 self.get_peer(&requester_id)?
@@ -269,7 +276,8 @@ impl Proxy {
                 &Rpc::GetPeerReq(
                     if name.is_none() { requester_name } else { name },
                     requester_id,
-                    conn_info,
+                    p2p_conn_info,
+                    direct_conn_info,
                 ),
             )
         } else {
@@ -289,20 +297,13 @@ impl Proxy {
         peer_set.remove(&peer_key); // remove self from the randomised selection process
 
         let known_peers: HashSet<_> = peer_self.peers_known.keys().collect();
-        trace!(
-            "{} already knows about {:?}",
-            self.peer_name(&peer_key),
-            known_peers
-                .iter()
-                .map(|id| self.peer_name(id))
-                .collect::<Vec<String>>()
-        );
+
         let unknown_peers = peer_set
             .difference(&known_peers)
             // filter out peers that don't have connection info
             .filter(|peer| {
                 if let Some(p) = self.peers.get(**peer) {
-                    p.conn_info.is_some() && p.details.is_some()
+                    p.p2p_conn_info.is_some() && p.direct_conn_info.is_some() && p.details.is_some()
                 } else {
                     false
                 }
@@ -315,40 +316,6 @@ impl Proxy {
     }
 
     fn add_log(&mut self, log: LogEntry) -> Result<(), Error> {
-        let is_hpin = log.peer_requester.ip == log.peer_responder.ip;
-
-        {
-            let mut stats = unwrap!(self.stats_mutex.lock());
-
-            if let NatTraversalResult::Succeeded = log.udp_hole_punch_result {
-                if is_hpin {
-                    stats.hairpin.udp_succ += 1;
-                } else {
-                    stats.no_hairpin.udp_succ += 1;
-                }
-            } else {
-                if is_hpin {
-                    stats.hairpin.udp_failures += 1;
-                } else {
-                    stats.no_hairpin.udp_failures += 1;
-                }
-            }
-
-            if let NatTraversalResult::Succeeded = log.tcp_hole_punch_result {
-                if is_hpin {
-                    stats.hairpin.tcp_succ += 1;
-                } else {
-                    stats.no_hairpin.tcp_succ += 1;
-                }
-            } else {
-                if is_hpin {
-                    stats.hairpin.tcp_failures += 1;
-                } else {
-                    stats.no_hairpin.tcp_failures += 1;
-                }
-            }
-        }
-
         stats::output_log(&log)
     }
 
@@ -415,49 +382,27 @@ impl Proxy {
                     }
 
                     let peer_requester = common::Peer {
+                        id: peer_key.0.clone(),
+                        name: requester.get_details(|d| d.name.clone())?,
                         ip: if let IpAddr::V4(ip_addr) = self.get_peer(&peer_key)?.addr {
                             ip_addr
                         } else {
                             unimplemented!("IPv6 is not supported");
                         },
-                        nat_type: From::from(
-                            requester
-                                .details
-                                .as_ref()
-                                .map(|d| d.nat_type())
-                                .ok_or(Error::PartialPeerInfo)?,
-                        ),
-                        os: format!(
-                            "{}",
-                            requester
-                                .details
-                                .as_ref()
-                                .map(|d| d.os.clone())
-                                .ok_or(Error::PartialPeerInfo)?
-                        ),
+                        nat_type: From::from(requester.get_details(|d| d.nat_type())?),
+                        os: format!("{}", requester.get_details(|d| d.os.clone())?),
                     };
 
                     let peer_responder = common::Peer {
+                        id: log.peer.0.clone(),
+                        name: responder.get_details(|d| d.name.clone())?,
                         ip: if let IpAddr::V4(ip_addr) = self.get_peer(&log.peer)?.addr {
                             ip_addr
                         } else {
                             unimplemented!("IPv6 is not supported")
                         },
-                        nat_type: From::from(
-                            responder
-                                .details
-                                .as_ref()
-                                .map(|d| d.nat_type())
-                                .ok_or(Error::PartialPeerInfo)?,
-                        ),
-                        os: format!(
-                            "{}",
-                            responder
-                                .details
-                                .as_ref()
-                                .map(|d| d.os.clone())
-                                .ok_or(Error::PartialPeerInfo)?
-                        ),
+                        nat_type: From::from(responder.get_details(|d| d.nat_type())?),
+                        os: format!("{}", responder.get_details(|d| d.os.clone())?),
                     };
 
                     (peer_requester, peer_responder)
@@ -468,27 +413,32 @@ impl Proxy {
                     peer_responder,
                     udp_hole_punch_result: From::from(log.udp_hole_punch_result),
                     tcp_hole_punch_result: From::from(log.tcp_hole_punch_result),
+                    is_direct_successful: log.is_direct_successful,
                 })?;
             }
-            Rpc::GetPeerReq(name, _public_id, conn) => {
-                self.get_peer_mut(&peer_key)?.conn_info = Some(conn);
+            Rpc::GetPeerReq(name, _public_id, p2p_conn, direct_conn) => {
+                {
+                    let peer = self.get_peer_mut(&peer_key)?;
+                    peer.p2p_conn_info = Some(p2p_conn);
+                    peer.direct_conn_info = Some(direct_conn);
+                }
                 let pair = self.match_peer(peer_key);
-                trace!(
-                    "Matching {} with {}",
-                    self.peer_name(&peer_key),
-                    if let Some(pk) = pair {
-                        self.peer_name(&pk)
-                    } else {
-                        "no one".to_string()
-                    }
-                );
+
+                if let Some(pk) = pair {
+                    trace!(
+                        "Matching {} with {}",
+                        self.peer_name(&peer_key),
+                        self.peer_name(&pk),
+                    );
+                }
+
                 self.connect_with_match(name, peer_key, pair)?;
             }
-            Rpc::GetPeerResp(name, Some((_, connection_info))) => {
+            Rpc::GetPeerResp(name, Some((_, p2p_connection_info, direct_conn_info))) => {
                 // Find pairing peer
                 let mut pair_peer_key = None;
                 for (peer, status) in &self.get_peer(&peer_key)?.peers_known {
-                    info!("known {} / {:?}", self.peer_name(peer), status);
+                    trace!("known {} / {:?}", self.peer_name(peer), status);
 
                     if self.get_peer(&peer)?.peers_known.get(&peer_key)
                         == Some(&PeerStatus::Pending)
@@ -500,7 +450,7 @@ impl Proxy {
                 }
 
                 if let Some(pair_peer_key) = pair_peer_key {
-                    info!("Connecting with {}", self.peer_name(&pair_peer_key));
+                    trace!("Connecting with {}", self.peer_name(&pair_peer_key));
 
                     let pair_peer_id = {
                         let pair_peer = self.get_peer_mut(&pair_peer_key)?;
@@ -511,7 +461,10 @@ impl Proxy {
 
                     self.send_rpc(
                         &pair_peer_id,
-                        &Rpc::GetPeerResp(name, Some((peer_key, connection_info))),
+                        &Rpc::GetPeerResp(
+                            name,
+                            Some((peer_key, p2p_connection_info, direct_conn_info)),
+                        ),
                     )?;
                 } else {
                     error!("Not found matching peer");
@@ -524,79 +477,6 @@ impl Proxy {
 
         Ok(())
     }
-}
-
-fn start_display_stats_thread(stats_mutex: Arc<Mutex<QuickStats>>) {
-    let joiner = thread::named("StatsPrinter", move || loop {
-        {
-            let stats = unwrap!(stats_mutex.lock());
-
-            let no_hpin = &stats.no_hairpin;
-            let hpin = &stats.hairpin;
-
-            let tcp_totals =
-                hpin.tcp_failures + hpin.tcp_succ + no_hpin.tcp_failures + no_hpin.tcp_succ;
-            let tcp_totals_succ = hpin.tcp_succ + no_hpin.tcp_succ;
-
-            let udp_totals =
-                hpin.udp_failures + hpin.udp_succ + no_hpin.udp_failures + no_hpin.udp_succ;
-            let udp_totals_succ = hpin.udp_succ + no_hpin.udp_succ;
-
-            let hpin_tcp_totals = hpin.tcp_failures + hpin.tcp_succ;
-            let hpin_udp_totals = hpin.udp_failures + hpin.udp_succ;
-
-            let no_hpin_tcp_totals = no_hpin.tcp_failures + no_hpin.tcp_succ;
-            let no_hpin_udp_totals = no_hpin.udp_failures + no_hpin.udp_succ;
-
-            let hpin_stats = if hpin_tcp_totals > 0 || hpin_udp_totals > 0 {
-                format!(
-                    "TCP (only hairpinning) %: {}, UDP (only hairpinning) %: {}\n",
-                    if hpin_tcp_totals > 0 {
-                        ((hpin.tcp_succ as f64 / hpin_tcp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    },
-                    if hpin_udp_totals > 0 {
-                        ((hpin.udp_succ as f64 / hpin_udp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    }
-                )
-            } else {
-                "".to_owned()
-            };
-
-            info!(
-                    "\nHole Punching Stats:\n{:#?}.\n\nSuccess stats:\nTCP (excluding hairpinning) %: {}, UDP (excluding hairpinning) %: {}\n{}TCP (combined) %: {}, UDP (combined) %: {}\n",
-                    *stats,
-                    if no_hpin_tcp_totals > 0 {
-                        ((no_hpin.tcp_succ as f64 / no_hpin_tcp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    },
-                    if no_hpin_udp_totals > 0 {
-                        ((no_hpin.udp_succ as f64 / no_hpin_udp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    },
-                    hpin_stats,
-                    if tcp_totals > 0 {
-                        ((tcp_totals_succ as f64 / tcp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    },
-                    if udp_totals > 0 {
-                        ((udp_totals_succ as f64 / udp_totals as f64) * 100.0).round()
-                    } else {
-                        0.0
-                    },
-                );
-        }
-
-        sleep(Duration::from_secs(60));
-    });
-
-    joiner.detach();
 }
 
 fn main() {
@@ -620,7 +500,7 @@ fn main() {
     } else {
         unreachable!("Unexpected category");
     };
-    if let Event::ListenerStarted(port) = unwrap!(crust_rx.recv()) {
+    if let Event::ListenerStarted(port, _igd) = unwrap!(crust_rx.recv()) {
         info!("Listening on port {}", port);
     }
 
@@ -628,27 +508,9 @@ fn main() {
 
     info!("Starting bootstrap proxy");
 
-    let stats = Arc::new(Mutex::new(QuickStats {
-        no_hairpin: StatPairs {
-            tcp_failures: 0,
-            tcp_succ: 0,
-            udp_failures: 0,
-            udp_succ: 0,
-        },
-        hairpin: StatPairs {
-            tcp_failures: 0,
-            tcp_succ: 0,
-            udp_failures: 0,
-            udp_succ: 0,
-        },
-    }));
-
     // Proxy handling peers and their messages
     let service = Rc::new(RefCell::new(service));
-    let mut proxy = Proxy::new(service.clone(), stats.clone());
-
-    // Output stats every 60 seconds
-    start_display_stats_thread(stats.clone());
+    let mut proxy = Proxy::new(service.clone());
 
     loop {
         match category_rx.recv() {
