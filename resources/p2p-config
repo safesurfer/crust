@@ -1,0 +1,31 @@
+{
+  "rendezvous_timeout_sec": null,
+  "hole_punch_timeout_sec": null,
+  "hole_punch_wait_for_other": null,
+  "udp_rendezvous_port": null,
+  "tcp_rendezvous_port": null,
+  "remote_udp_rendezvous_servers": [
+    "104.248.175.190:5483",
+    "142.93.32.236:5483",
+    "104.248.160.124:5483"
+  ],
+  "remote_tcp_rendezvous_servers": [
+    "104.248.175.190:5484",
+    "142.93.32.236:5484",
+    "104.248.160.124:5484"
+  ],
+  "udp_hole_punchers": [
+    {
+      "starting_ttl": 2,
+      "ttl_increment_delay_ms": 500
+    },
+    {
+      "starting_ttl": 5,
+      "ttl_increment_delay_ms": 500
+    },
+    {
+      "starting_ttl": 10,
+      "ttl_increment_delay_ms": 500
+    }
+  ]
+}
