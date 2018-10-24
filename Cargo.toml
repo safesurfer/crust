@@ -33,7 +33,7 @@ get_if_addrs = "~0.4.1"
 [dev-dependencies]
 clap = "~2.25.1"
 hex_fmt = "~0.2.0"
-p2p = { git = "https://github.com/nbaksalyar/p2p.git", rev = "0244b4bc55" }
+p2p = { git = "https://github.com/nbaksalyar/p2p.git", rev = "fbdc955" }
 
 [[example]]
 bench = false
