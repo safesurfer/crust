@@ -529,7 +529,7 @@ impl Client {
     }
 
     fn parse_direct_conn_result(&mut self, peer_id: &Id, is_successful: bool) -> Result<(), Error> {
-        trace!(
+        debug!(
             "Direct conn from PeerID {:<8}\n\nconn map {:?}",
             HexFmt(peer_id.0),
             self.id_to_conn_map
@@ -686,14 +686,16 @@ impl Client {
         log_output.push_str(&format!(
             "Direct connection result: {}\n",
             if is_direct_successful {
+                let their_is_global = ip_addr_is_global(&unwrap!(their_direct_ip));
+
                 format!(
                     "{} (us) <-> {} (them)",
-                    if let Some(ip) = our_ip {
-                        format!("{}", ip)
+                    if our_ip.is_some() && their_is_global {
+                        format!("{}", unwrap!(our_ip))
                     } else {
                         "Local".to_owned()
                     },
-                    if let Some(_) = our_ip {
+                    if our_ip.is_some() && their_is_global {
                         format!("{}", unwrap!(their_direct_ip))
                     } else {
                         "Local".to_owned()

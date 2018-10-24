@@ -112,6 +112,7 @@ pub use main::{
     read_config_file, Config, ConnectionInfoResult, CrustError, Event, PrivConnectionInfo,
     PubConnectionInfo, Service,
 };
+pub use nat::ip_addr_is_global;
 
 /// Used to receive events from a `Service`.
 pub type CrustEventSender<UID> = ::maidsafe_utilities::event_sender::MaidSafeObserver<Event<UID>>;
