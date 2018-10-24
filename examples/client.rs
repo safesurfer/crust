@@ -174,6 +174,7 @@ struct HolePunchStats {
 
 /// Represents the current state of collected connection results.
 /// Once becomes `Both`, we send the log update to the proxy.
+#[derive(Debug)]
 enum ConnResults {
     Empty,
     HolePunch(Result<HolePunchStats, ()>),
@@ -191,6 +192,17 @@ struct PeerConnInfo {
     handle: Option<P2pHandle>,
 }
 
+impl fmt::Debug for PeerConnInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "PeerConnInfo {{ our_global_addr: {:?}, their_id: {:?} }}",
+            self.our_global_addr, self.their_id
+        )
+    }
+}
+
+#[derive(Debug)]
 enum PeerState {
     /// Gathering conn info
     ConnectionInfo {
@@ -850,7 +862,7 @@ impl Client {
         self.service.borrow().prepare_connection_info(res_token);
         get_rendezvous_info(&self.p2p_el, self.client_tx.clone(), res_token);
 
-        self.peer_states.insert(
+        let _ = self.peer_states.insert(
             self.conn_id,
             PeerState::ConnectionInfo {
                 is_requester,
@@ -961,7 +973,12 @@ impl Client {
             HexFmt(self.our_id.clone()),
             conn_id
         );
-        self.id_to_conn_map.insert(self.our_id.clone(), conn_id);
+        let prev_conn_id = self.id_to_conn_map.insert(self.our_id.clone(), conn_id);
+
+        // Drop the previous connection
+        if let Some(prev_conn_id) = prev_conn_id {
+            let _ = self.peer_states.remove(&prev_conn_id);
+        }
 
         Ok(())
     }
