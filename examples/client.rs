@@ -451,34 +451,24 @@ impl Client {
                 .connect(our_direct_ci, their_direct_ci)?;
         }
 
+        let our_p2p_ci2 = our_p2p_ci.clone();
+
         // Attempt hole punching
+        handle.fire_hole_punch(
+            their_rendezvous_info,
+            Box::new(move |_, _, res| {
+                // Hole punch result
+                let hole_punch_stats = collect_hole_punch_result(&our_p2p_ci2, res, &udp_hp);
+                unwrap!(client_tx.send(Msg::HolePunchResult(conn_id, hole_punch_stats)));
+            }),
+        );
+
         if !is_requester {
-            let our_p2p_ci2 = our_p2p_ci.clone();
-
-            handle.fire_hole_punch(
-                their_rendezvous_info,
-                Box::new(move |_, _, res| {
-                    // Hole punch result
-                    let hole_punch_stats = collect_hole_punch_result(&our_p2p_ci2, res, &udp_hp);
-                    unwrap!(client_tx.send(Msg::HolePunchResult(conn_id, hole_punch_stats)));
-                }),
-            );
-
             // Send our responder connection info
             self.send_rpc(&Rpc::GetPeerResp(
                 self.name.clone(),
                 Some((self.our_id, our_p2p_ci, our_pub_direct_ci)),
             ))?;
-        } else {
-            handle.fire_hole_punch(
-                their_rendezvous_info,
-                Box::new(move |_, _, res| {
-                    // Hole punch result
-                    let hole_punch_stats = collect_hole_punch_result(&our_p2p_ci, res, &udp_hp);
-                    unwrap!(client_tx.send(Msg::HolePunchResult(conn_id, hole_punch_stats)));
-                    unwrap!(client_tx.send(Msg::RetryConnect));
-                }),
-            );
         }
 
         Ok(())
@@ -522,7 +512,7 @@ impl Client {
                 }
             }
             ConnResults::Direct(their_endpoint) => {
-                self.report_connection_result(
+                self.finalise_connection(
                     conn_id,
                     their_id,
                     their_endpoint,
@@ -612,7 +602,7 @@ impl Client {
                 }
             }
             ConnResults::HolePunch(hp_res) => {
-                self.report_connection_result(
+                self.finalise_connection(
                     conn_id,
                     their_id,
                     their_endpoint,
@@ -629,7 +619,7 @@ impl Client {
         Ok(())
     }
 
-    fn report_connection_result(
+    fn finalise_connection(
         &mut self,
         conn_id: ConnId,
         peer_id: PublicEncryptKey,
@@ -757,13 +747,16 @@ impl Client {
             trace!("Sending stats");
             trace!("{:?}", log_upd);
             self.send_rpc(&Rpc::UploadLog(log_upd))?;
+
+            // Seek for a next peer
+            unwrap!(self.client_tx.send(Msg::RetryConnect));
         }
 
         Ok(())
     }
 
     /// Probes NAT and detects the user's OS.
-    fn collect_details(&mut self, upnp_support: bool) -> Result<(), Error> {
+    fn collect_details(&mut self, igd_success: bool) -> Result<(), Error> {
         info!("Detecting NAT type...");
 
         let (nat_info, rendezvous_res) = match get_rendezvous_info_blocking(&self.p2p_el) {
@@ -782,10 +775,10 @@ impl Client {
 
         info!(
             "{}",
-            if upnp_support {
-                "UPnP is supported"
+            if igd_success {
+                "IGD succeeded"
             } else {
-                "UPnP is not supported"
+                "IGD failed"
             }
         );
 
@@ -797,7 +790,7 @@ impl Client {
             nat_type_udp,
             nat_type_tcp,
             os: os_type,
-            upnp: upnp_support,
+            upnp: igd_success,
             version: GIT_COMMIT.to_owned(),
         }))?;
 
