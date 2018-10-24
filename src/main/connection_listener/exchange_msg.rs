@@ -383,6 +383,10 @@ impl<UID: Uid> ExchangeMsg<UID> {
     }
 
     fn done(&mut self, core: &mut Core, poll: &Poll) {
+        if let NextState::None = self.next_state {
+            return;
+        }
+
         let _ = core.remove_state(self.token);
         let _ = core.cancel_timeout(&self.timeout);
 
@@ -438,7 +442,7 @@ impl<UID: Uid> ExchangeMsg<UID> {
                     Box::new(handler),
                 );
             }
-            NextState::None => self.terminate(core, poll),
+            NextState::None => {}
         }
     }
 
