@@ -10,8 +10,9 @@
 use common::Uid;
 use main::Config;
 use mio::Token;
+use nat::ip_addr_is_global;
 use net2::TcpBuilder;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 // ========================================================================================
 //                                     ConnectionId
@@ -59,6 +60,16 @@ impl<UID: Uid> PrivConnectionInfo<UID> {
             for_direct: self.for_direct.clone(),
             id: self.id,
         }
+    }
+
+    /// Returns the first global IP from the array of all direct connection endpoints
+    pub fn direct_global_ip(&self) -> Option<IpAddr> {
+        for addr in &self.for_direct {
+            if ip_addr_is_global(&addr.ip()) {
+                return Some(addr.ip());
+            }
+        }
+        None
     }
 }
 
