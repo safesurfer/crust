@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-const TIMEOUT_SEC: u64 = 60;
+const TIMEOUT_SEC: u64 = 15;
 
 pub struct Connect<UID: Uid> {
     token: Token,
