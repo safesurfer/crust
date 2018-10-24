@@ -49,7 +49,7 @@ fn bootstrap_two_services_and_exchange_messages() {
 
     unwrap!(service0.start_listening_tcp());
 
-    let port0 = expect_event!(event_rx0, Event::ListenerStarted(port) => port);
+    let port0 = expect_event!(event_rx0, Event::ListenerStarted(port, _) => port);
     unwrap!(service0.set_accept_bootstrap(true));
 
     let mut config1 = gen_config();
@@ -103,13 +103,13 @@ fn bootstrap_two_services_using_service_discovery() {
     let mut service1 = unwrap!(Service::with_config(event_tx1, config, rand::random()));
 
     unwrap!(service1.start_listening_tcp());
-    let _ = expect_event!(event_rx1, Event::ListenerStarted(port) => port);
+    let _ = expect_event!(event_rx1, Event::ListenerStarted(port, _) => port);
 
     service0.start_service_discovery();
     service0.set_service_discovery_listen(true);
     unwrap!(service0.start_listening_tcp());
 
-    expect_event!(event_rx0, Event::ListenerStarted(_port));
+    expect_event!(event_rx0, Event::ListenerStarted(_port, _));
     unwrap!(service0.set_accept_bootstrap(true));
 
     service1.start_service_discovery();
@@ -133,7 +133,7 @@ fn bootstrap_with_multiple_contact_endpoints() {
         rand::random()
     ));
     unwrap!(service0.start_listening_tcp());
-    let port = expect_event!(event_rx0, Event::ListenerStarted(port) => port);
+    let port = expect_event!(event_rx0, Event::ListenerStarted(port, _) => port);
     unwrap!(service0.set_accept_bootstrap(true));
     let valid_address = localhost(port);
 
@@ -148,7 +148,7 @@ fn bootstrap_with_multiple_contact_endpoints() {
     unwrap!(service1.start_bootstrap(HashSet::new(), CrustUser::Client));
 
     unwrap!(service1.start_listening_tcp());
-    let _ = expect_event!(event_rx1, Event::ListenerStarted(port) => port);
+    let _ = expect_event!(event_rx1, Event::ListenerStarted(port, _) => port);
 
     let peer_id0 = expect_event!(event_rx1, Event::BootstrapConnect(peer_id, _) => peer_id);
     assert_eq!(peer_id0, service0.id());
@@ -167,7 +167,7 @@ fn bootstrap_with_skipped_external_reachability_test() {
     let (event_tx0, event_rx0) = get_event_sender();
     let mut service0 = unwrap!(Service::with_config(event_tx0, config, rand::random()));
     unwrap!(service0.start_listening_tcp());
-    let port = expect_event!(event_rx0, Event::ListenerStarted(port) => port);
+    let port = expect_event!(event_rx0, Event::ListenerStarted(port, _) => port);
     unwrap!(service0.set_accept_bootstrap(true));
 
     let mut config1 = gen_config();
@@ -195,7 +195,7 @@ fn bootstrap_with_blacklist() {
         rand::random()
     ));
     unwrap!(service0.start_listening_tcp());
-    let port = expect_event!(event_rx0, Event::ListenerStarted(port) => port);
+    let port = expect_event!(event_rx0, Event::ListenerStarted(port, _) => port);
     unwrap!(service0.set_accept_bootstrap(true));
     let valid_address = localhost(port);
 
@@ -212,7 +212,7 @@ fn bootstrap_with_blacklist() {
     unwrap!(service1.start_bootstrap(blacklist, CrustUser::Client));
 
     unwrap!(service1.start_listening_tcp());
-    let _ = expect_event!(event_rx1, Event::ListenerStarted(port) => port);
+    let _ = expect_event!(event_rx1, Event::ListenerStarted(port, _) => port);
 
     let peer_id0 = expect_event!(event_rx1, Event::BootstrapConnect(peer_id, _) => peer_id);
     assert_eq!(peer_id0, service0.id());
@@ -292,7 +292,7 @@ fn drop_disconnects() {
     let mut service_0 = unwrap!(Service::with_config(event_tx_0, config_0, rand::random()));
 
     unwrap!(service_0.start_listening_tcp());
-    let port = expect_event!(event_rx_0, Event::ListenerStarted(port) => port);
+    let port = expect_event!(event_rx_0, Event::ListenerStarted(port, _) => port);
     unwrap!(service_0.set_accept_bootstrap(true));
 
     let mut config_1 = gen_config();
@@ -449,7 +449,7 @@ fn do_not_drop_peer_even_when_no_data_messages_are_exchanged_within_inactivity_p
     let mut service0 = unwrap!(Service::with_config(event_tx0, config0, rand::random()));
 
     unwrap!(service0.start_listening_tcp());
-    let port0 = expect_event!(event_rx0, Event::ListenerStarted(port) => port);
+    let port0 = expect_event!(event_rx0, Event::ListenerStarted(port, _) => port);
     unwrap!(service0.set_accept_bootstrap(true));
 
     let mut config1 = gen_config();

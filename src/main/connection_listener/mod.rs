@@ -287,7 +287,7 @@ mod tests {
 
         for it in event_rx.iter() {
             match it {
-                Event::ListenerStarted(_port) => break,
+                Event::ListenerStarted(_port, _) => break,
                 _ => panic!("Unexpected event notification - {:?}", it),
             }
         }

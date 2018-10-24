@@ -593,7 +593,7 @@ mod tests {
             let mut service = unwrap!(Service::new(event_tx, rand::random()));
 
             unwrap!(service.start_listening_tcp());
-            expect_event!(event_rx, Event::ListenerStarted(_));
+            expect_event!(event_rx, Event::ListenerStarted(_, _));
 
             service.prepare_connection_info(0);
 
@@ -617,13 +617,13 @@ mod tests {
             let mut service_0 = unwrap!(Service::new(event_tx_0, rand::random()));
 
             unwrap!(service_0.start_listening_tcp());
-            expect_event!(event_rx_0, Event::ListenerStarted(_));
+            expect_event!(event_rx_0, Event::ListenerStarted(_, _));
 
             let (event_tx_1, event_rx_1) = get_event_sender();
             let mut service_1 = unwrap!(Service::new(event_tx_1, rand::random()));
 
             unwrap!(service_1.start_listening_tcp());
-            expect_event!(event_rx_1, Event::ListenerStarted(_));
+            expect_event!(event_rx_1, Event::ListenerStarted(_, _));
 
             connect(&service_0, &event_rx_0, &service_1, &event_rx_1);
             exchange_messages(&service_0, &event_rx_0, &service_1, &event_rx_1);
@@ -750,7 +750,7 @@ mod tests {
                 // Start listener so that the test works without hole punching.
                 assert!(service.start_listening_tcp().is_ok());
                 match unwrap!(event_rx.recv()) {
-                    Event::ListenerStarted(_) => (),
+                    Event::ListenerStarted(_, _) => (),
                     m => panic!("Unexpected event: {:?}", m),
                 }
                 let (ci_tx, ci_rx) = mpsc::channel();

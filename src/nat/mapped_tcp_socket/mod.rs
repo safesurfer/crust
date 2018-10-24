@@ -157,6 +157,7 @@ where
     }
 
     fn handle_igd_resp(&mut self, core: &mut Core, poll: &Poll, our_ext_addr: SocketAddr) {
+        trace!("got IGD address {:?}", our_ext_addr);
         self.igd_children -= 1;
         self.igd_success = true;
         self.mapped_addrs.push(our_ext_addr);
