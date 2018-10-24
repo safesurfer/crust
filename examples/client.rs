@@ -177,7 +177,8 @@ struct HolePunchStats {
 enum ConnResults {
     Empty,
     HolePunch(Result<HolePunchStats, ()>),
-    Direct(bool, IpAddr),
+    /// If it is Some(ip), then the connection was successful
+    Direct(Option<IpAddr>),
 }
 
 struct PeerConnInfo {
@@ -218,6 +219,7 @@ struct Client {
     id_to_conn_map: HashMap<PublicEncryptKey, ConnId>,
     peer_states: HashMap<ConnId, PeerState>,
     peer_names: HashMap<PublicEncryptKey, String>,
+    pending_direct_conns: HashMap<PublicEncryptKey, Option<IpAddr>>,
     p2p_el: El,
     display_available_peers: bool,
     /// A Vec of UdpHolePuncher::starting_ttl
@@ -248,6 +250,7 @@ impl Client {
             attempted_conns: Vec::new(),
             failed_conns: Vec::new(),
             our_nat_info: Default::default(),
+            pending_direct_conns: Default::default(),
             p2p_el,
             display_available_peers: true,
             udp_hole_punchers,
@@ -372,30 +375,41 @@ impl Client {
     }
 
     fn connect(&mut self, conn_id: ConnId) -> Result<(), Error> {
-        let (mut peer, is_requester) = {
-            let peer_state = self
+        let (mut peer, is_requester, is_already_connected) = {
+            let peer = self
                 .peer_states
                 .get_mut(&conn_id)
-                .and_then(|peer| {
-                    let (is_requester, their_id, our_global_ip) =
-                        if let PeerState::ConnectionInfo { is_requester, ci } = peer {
-                            (*is_requester, ci.their_id.clone(), ci.our_global_ip.clone())
-                        } else {
-                            unreachable!("Invalid peer state");
-                        };
-                    Some(mem::replace(
-                        peer,
-                        PeerState::Connecting {
-                            is_requester,
-                            our_global_ip,
-                            their_id: unwrap!(their_id),
-                            res: ConnResults::Empty,
-                        },
-                    ))
-                }).ok_or(Error::PeerNotFound)?;
+                .ok_or(Error::PeerNotFound)?;
 
-            if let PeerState::ConnectionInfo { ci, is_requester } = peer_state {
-                (ci, is_requester)
+            let (is_requester, their_id, our_global_ip) =
+                if let PeerState::ConnectionInfo { is_requester, ci } = peer {
+                    (*is_requester, ci.their_id.clone(), ci.our_global_ip.clone())
+                } else {
+                    unreachable!("Invalid peer state");
+                };
+
+            let their_id = unwrap!(their_id);
+
+            let (is_already_connected, initial_conn_res) =
+                if self.pending_direct_conns.contains_key(&their_id) {
+                    let conn_ip = unwrap!(self.pending_direct_conns.remove(&their_id));
+                    (true, ConnResults::Direct(conn_ip))
+                } else {
+                    (false, ConnResults::Empty)
+                };
+
+            let prev_peer_state = mem::replace(
+                peer,
+                PeerState::Connecting {
+                    is_requester,
+                    our_global_ip,
+                    their_id,
+                    res: initial_conn_res,
+                },
+            );
+
+            if let PeerState::ConnectionInfo { ci, is_requester } = prev_peer_state {
+                (ci, is_requester, is_already_connected)
             } else {
                 unreachable!("Invalid peer state");
             }
@@ -410,13 +424,16 @@ impl Client {
         let our_pub_direct_ci = our_direct_ci.to_pub_connection_info();
         let their_direct_ci = unwrap!(peer.their_direct_ci.take());
         let their_rendezvous_info = unwrap!(peer.their_rendezvous_info.take());
+        let their_id = unwrap!(peer.their_id.take());
 
         // Attempt a direct connection
-        self.id_to_conn_map
-            .insert(unwrap!(peer.their_id.take()), conn_id);
-        self.service
-            .borrow()
-            .connect(our_direct_ci, their_direct_ci)?;
+        if !is_already_connected {
+            trace!("Map conn {:<8} <-> {}", HexFmt(their_id), conn_id);
+            self.id_to_conn_map.insert(their_id, conn_id);
+            self.service
+                .borrow()
+                .connect(our_direct_ci, their_direct_ci)?;
+        }
 
         // Attempt hole punching
         if !is_requester {
@@ -431,12 +448,12 @@ impl Client {
                 }),
             );
 
+            // Send our responder connection info
             self.send_rpc(&Rpc::GetPeerResp(
                 self.name.clone(),
                 Some((self.our_id, our_p2p_ci, our_pub_direct_ci)),
             ))?;
         } else {
-            // Attempt hole punching
             handle.fire_hole_punch(
                 their_rendezvous_info,
                 Box::new(move |_, _, res| {
@@ -488,13 +505,13 @@ impl Client {
                     *res = ConnResults::HolePunch(hole_punch_stats);
                 }
             }
-            ConnResults::Direct(direct_conn_res, their_ip) => {
+            ConnResults::Direct(their_ip) => {
                 self.report_connection_result(
                     conn_id,
                     their_id,
                     their_ip,
                     hole_punch_stats,
-                    direct_conn_res,
+                    their_ip.is_some(),
                     is_requester,
                 )?;
             }
@@ -512,12 +529,17 @@ impl Client {
     }
 
     fn parse_direct_conn_result(&mut self, peer_id: &Id, is_successful: bool) -> Result<(), Error> {
-        let conn_id = self
-            .id_to_conn_map
-            .remove(&peer_id.0)
-            .ok_or(Error::ConnectionNotFound)?;
+        trace!(
+            "Direct conn from PeerID {:<8}\n\nconn map {:?}",
+            HexFmt(peer_id.0),
+            self.id_to_conn_map
+        );
 
-        let their_ip = self.service.borrow().get_peer_ip_addr(peer_id)?;
+        let their_ip = if is_successful {
+            Some(self.service.borrow().get_peer_ip_addr(peer_id)?)
+        } else {
+            None
+        };
 
         if is_successful {
             let client_tx = self.client_tx.clone();
@@ -528,6 +550,17 @@ impl Client {
                 unwrap!(client_tx.send(Msg::DisconnectPeer(peer_id)));
             }).detach();
         }
+
+        if !self.id_to_conn_map.contains_key(&peer_id.0) {
+            // Add a pending connection
+            self.pending_direct_conns.insert(peer_id.0, their_ip);
+            return Ok(());
+        }
+
+        let conn_id = self
+            .id_to_conn_map
+            .remove(&peer_id.0)
+            .ok_or(Error::ConnectionNotFound)?;
 
         // Update the peer state
         let (old_state, is_requester, their_id) = {
@@ -557,7 +590,7 @@ impl Client {
                     .get_mut(&conn_id)
                     .ok_or(Error::PeerNotFound)?
                 {
-                    *res = ConnResults::Direct(is_successful, their_ip);
+                    *res = ConnResults::Direct(their_ip);
                 } else {
                     unreachable!("Invalid peer state");
                 }
@@ -584,7 +617,7 @@ impl Client {
         &mut self,
         conn_id: ConnId,
         peer_id: PublicEncryptKey,
-        their_ip: IpAddr,
+        their_direct_ip: Option<IpAddr>,
         hole_punch_result: Result<HolePunchStats, ()>,
         is_direct_successful: bool,
         send_stats: bool,
@@ -661,7 +694,7 @@ impl Client {
                         "Local".to_owned()
                     },
                     if let Some(_) = our_ip {
-                        format!("{}", their_ip)
+                        format!("{}", unwrap!(their_direct_ip))
                     } else {
                         "Local".to_owned()
                     }
@@ -914,6 +947,11 @@ impl Client {
 
     fn await_peer(&mut self) -> Result<(), Error> {
         let conn_id = self.initiate_connection(None, None, None, true);
+        debug!(
+            "Map conn {:<8} <-> {}",
+            HexFmt(self.our_id.clone()),
+            conn_id
+        );
         self.id_to_conn_map.insert(self.our_id.clone(), conn_id);
 
         Ok(())
@@ -1202,9 +1240,11 @@ fn main() {
                     unwrap!(client.set_direct_conn_info(conn_info));
                 }
                 Ok(Event::ConnectSuccess(peer_id)) => {
+                    debug!("Event::ConnectSuccess {:<8}", HexFmt(peer_id.0));
                     unwrap!(client.parse_direct_conn_result(&peer_id, true));
                 }
                 Ok(Event::ConnectFailure(peer_id)) => {
+                    debug!("Event::ConnectFailure {:<8}", HexFmt(peer_id.0));
                     unwrap!(client.parse_direct_conn_result(&peer_id, false));
                 }
                 Ok(Event::NewMessage(peer_id, _user, data)) => {
