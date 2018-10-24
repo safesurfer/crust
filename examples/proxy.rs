@@ -221,7 +221,7 @@ impl Proxy {
             return Ok(());
         }
 
-        let peer_addr = self.service.borrow().get_peer_ip_addr(&peer)?;
+        let peer_addr = self.service.borrow().get_peer_socket_addr(&peer)?;
 
         info!(
             "New peer! ID: {:<8}, addr: {:?}",
@@ -229,7 +229,7 @@ impl Proxy {
             peer_addr
         );
 
-        let new_peer = ConnectedPeer::new(peer_key.clone(), peer_addr);
+        let new_peer = ConnectedPeer::new(peer_key.clone(), peer_addr.ip());
         self.peers.insert(peer_key, new_peer);
 
         Ok(())
