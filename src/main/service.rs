@@ -24,7 +24,7 @@ use rust_sodium;
 use service_discovery::ServiceDiscovery;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{mpsc, Arc, Mutex};
 use tiny_keccak::sha3_256;
 
@@ -182,7 +182,8 @@ impl<UID: Uid> Service<UID> {
         });
     }
 
-    fn get_peer_socket_addr(&self, peer_uid: &UID) -> ::Res<SocketAddr> {
+    /// Return the endpoint of the peer.
+    pub fn get_peer_socket_addr(&self, peer_uid: &UID) -> ::Res<SocketAddr> {
         let token = match unwrap!(self.cm.lock()).get(peer_uid) {
             Some(&ConnectionId {
                 active_connection: Some(token),
@@ -221,11 +222,6 @@ impl<UID: Uid> Service<UID> {
             Ok(None) => Err(CrustError::PeerNotFound),
             Err(e) => Err(CrustError::ChannelRecv(e)),
         }
-    }
-
-    /// Return the ip address of the peer.
-    pub fn get_peer_ip_addr(&self, peer_uid: &UID) -> ::Res<IpAddr> {
-        self.get_peer_socket_addr(peer_uid).map(|s| s.ip())
     }
 
     /// Returns whether the given peer's IP is in the config file's hard-coded contacts list.

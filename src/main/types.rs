@@ -12,7 +12,7 @@ use main::Config;
 use mio::Token;
 use nat::ip_addr_is_global;
 use net2::TcpBuilder;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 // ========================================================================================
 //                                     ConnectionId
@@ -63,10 +63,10 @@ impl<UID: Uid> PrivConnectionInfo<UID> {
     }
 
     /// Returns the first global IP from the array of all direct connection endpoints
-    pub fn direct_global_ip(&self) -> Option<IpAddr> {
+    pub fn direct_global_addr(&self) -> Option<SocketAddr> {
         for addr in &self.for_direct {
             if ip_addr_is_global(&addr.ip()) {
-                return Some(addr.ip());
+                return Some(addr.clone());
             }
         }
         None

@@ -60,7 +60,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::{self, BufRead, Write};
 use std::mem;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::sleep;
@@ -177,12 +177,12 @@ struct HolePunchStats {
 enum ConnResults {
     Empty,
     HolePunch(Result<HolePunchStats, ()>),
-    /// If it is Some(ip), then the connection was successful
-    Direct(Option<IpAddr>),
+    /// If it is Some(address), then the connection was successful
+    Direct(Option<SocketAddr>),
 }
 
 struct PeerConnInfo {
-    our_global_ip: Option<IpAddr>,
+    our_global_addr: Option<SocketAddr>,
     our_direct_ci: Option<PrivConnectionInfo<Id>>,
     our_rendezvous_info: Option<RendezvousInfo>,
     their_direct_ci: Option<PubConnectionInfo<Id>>,
@@ -200,7 +200,7 @@ enum PeerState {
     /// Attempting to connect
     Connecting {
         is_requester: bool,
-        our_global_ip: Option<IpAddr>,
+        our_global_addr: Option<SocketAddr>,
         their_id: PublicEncryptKey,
         res: ConnResults,
     },
@@ -219,7 +219,7 @@ struct Client {
     id_to_conn_map: HashMap<PublicEncryptKey, ConnId>,
     peer_states: HashMap<ConnId, PeerState>,
     peer_names: HashMap<PublicEncryptKey, String>,
-    pending_direct_conns: HashMap<PublicEncryptKey, Option<IpAddr>>,
+    pending_direct_conns: HashMap<PublicEncryptKey, Option<SocketAddr>>,
     p2p_el: El,
     display_available_peers: bool,
     /// A Vec of UdpHolePuncher::starting_ttl
@@ -358,7 +358,7 @@ impl Client {
             {
                 let direct_ci = conn_info.result?;
 
-                (*ci).our_global_ip = direct_ci.direct_global_ip();
+                (*ci).our_global_addr = direct_ci.direct_global_addr();
                 (*ci).our_direct_ci = Some(direct_ci);
 
                 (ci.our_rendezvous_info.is_some(), *is_requester)
@@ -381,9 +381,13 @@ impl Client {
                 .get_mut(&conn_id)
                 .ok_or(Error::PeerNotFound)?;
 
-            let (is_requester, their_id, our_global_ip) =
+            let (is_requester, their_id, our_global_addr) =
                 if let PeerState::ConnectionInfo { is_requester, ci } = peer {
-                    (*is_requester, ci.their_id.clone(), ci.our_global_ip.clone())
+                    (
+                        *is_requester,
+                        ci.their_id.clone(),
+                        ci.our_global_addr.clone(),
+                    )
                 } else {
                     unreachable!("Invalid peer state");
                 };
@@ -392,8 +396,8 @@ impl Client {
 
             let (is_already_connected, initial_conn_res) =
                 if self.pending_direct_conns.contains_key(&their_id) {
-                    let conn_ip = unwrap!(self.pending_direct_conns.remove(&their_id));
-                    (true, ConnResults::Direct(conn_ip))
+                    let conn_ep = unwrap!(self.pending_direct_conns.remove(&their_id));
+                    (true, ConnResults::Direct(conn_ep))
                 } else {
                     (false, ConnResults::Empty)
                 };
@@ -402,7 +406,7 @@ impl Client {
                 peer,
                 PeerState::Connecting {
                     is_requester,
-                    our_global_ip,
+                    our_global_addr,
                     their_id,
                     res: initial_conn_res,
                 },
@@ -505,13 +509,13 @@ impl Client {
                     *res = ConnResults::HolePunch(hole_punch_stats);
                 }
             }
-            ConnResults::Direct(their_ip) => {
+            ConnResults::Direct(their_endpoint) => {
                 self.report_connection_result(
                     conn_id,
                     their_id,
-                    their_ip,
+                    their_endpoint,
                     hole_punch_stats,
-                    their_ip.is_some(),
+                    their_endpoint.is_some(),
                     is_requester,
                 )?;
             }
@@ -535,8 +539,8 @@ impl Client {
             self.id_to_conn_map
         );
 
-        let their_ip = if is_successful {
-            Some(self.service.borrow().get_peer_ip_addr(peer_id)?)
+        let their_endpoint = if is_successful {
+            Some(self.service.borrow().get_peer_socket_addr(peer_id)?)
         } else {
             None
         };
@@ -553,7 +557,7 @@ impl Client {
 
         if !self.id_to_conn_map.contains_key(&peer_id.0) {
             // Add a pending connection
-            self.pending_direct_conns.insert(peer_id.0, their_ip);
+            self.pending_direct_conns.insert(peer_id.0, their_endpoint);
             return Ok(());
         }
 
@@ -590,7 +594,7 @@ impl Client {
                     .get_mut(&conn_id)
                     .ok_or(Error::PeerNotFound)?
                 {
-                    *res = ConnResults::Direct(their_ip);
+                    *res = ConnResults::Direct(their_endpoint);
                 } else {
                     unreachable!("Invalid peer state");
                 }
@@ -599,7 +603,7 @@ impl Client {
                 self.report_connection_result(
                     conn_id,
                     their_id,
-                    their_ip,
+                    their_endpoint,
                     hp_res,
                     is_successful,
                     is_requester,
@@ -617,7 +621,7 @@ impl Client {
         &mut self,
         conn_id: ConnId,
         peer_id: PublicEncryptKey,
-        their_direct_ip: Option<IpAddr>,
+        their_direct_endpoint: Option<SocketAddr>,
         hole_punch_result: Result<HolePunchStats, ()>,
         is_direct_successful: bool,
         send_stats: bool,
@@ -626,8 +630,11 @@ impl Client {
             .peer_states
             .remove(&conn_id)
             .ok_or(Error::PeerNotFound)?;
-        let our_ip = if let PeerState::Connecting { our_global_ip, .. } = ci_state {
-            our_global_ip
+        let our_endpoint = if let PeerState::Connecting {
+            our_global_addr, ..
+        } = ci_state
+        {
+            our_global_addr
         } else {
             unreachable!("Invalid peer state");
         };
@@ -686,17 +693,17 @@ impl Client {
         log_output.push_str(&format!(
             "Direct connection result: {}\n",
             if is_direct_successful {
-                let their_is_global = ip_addr_is_global(&unwrap!(their_direct_ip));
+                let their_is_global = ip_addr_is_global(&unwrap!(their_direct_endpoint).ip());
 
                 format!(
                     "{} (us) <-> {} (them)",
-                    if our_ip.is_some() && their_is_global {
-                        format!("{}", unwrap!(our_ip))
+                    if our_endpoint.is_some() && their_is_global {
+                        format!("{}", unwrap!(our_endpoint))
                     } else {
                         "Local".to_owned()
                     },
-                    if our_ip.is_some() && their_is_global {
-                        format!("{}", unwrap!(their_direct_ip))
+                    if our_endpoint.is_some() && their_is_global {
+                        format!("{}", unwrap!(their_direct_endpoint))
                     } else {
                         "Local".to_owned()
                     }
@@ -848,7 +855,7 @@ impl Client {
             PeerState::ConnectionInfo {
                 is_requester,
                 ci: PeerConnInfo {
-                    our_global_ip: None,
+                    our_global_addr: None,
                     our_direct_ci: None,
                     our_rendezvous_info: None,
                     handle: None,
