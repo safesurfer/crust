@@ -20,7 +20,7 @@
 pub mod event_loop;
 
 use crust::{PubConnectionInfo, Uid};
-use p2p::{NatType as P2pNatType, RendezvousInfo};
+use p2p::{NatInfo, NatType as P2pNatType, RendezvousInfo};
 use rust_sodium::crypto::box_::PublicKey;
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -151,6 +151,7 @@ pub enum Rpc {
     ),
     UploadLog(LogUpdate),
     WrongVersion(String),
+    ChangeNatType(NatInfo),
 }
 
 impl fmt::Display for Rpc {
@@ -166,6 +167,7 @@ impl fmt::Display for Rpc {
             ),
             UploadLog(..) => write!(fmt, "UploadLog"),
             WrongVersion(..) => write!(fmt, "WrongVersion"),
+            ChangeNatType(..) => write!(fmt, "ChangeNatType"),
         }
     }
 }

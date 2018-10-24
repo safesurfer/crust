@@ -366,6 +366,26 @@ impl Proxy {
                 let peer = self.get_peer_mut(&peer_key)?;
                 peer.details = Some(peer_details);
             }
+            Rpc::ChangeNatType(new_nat_type) => {
+                let peer = self.get_peer_mut(&peer_key)?;
+
+                peer.details.as_mut().map(move |prev| {
+                    let mut map = HashMap::new();
+                    map.insert("from_tcp".to_owned(), prev.nat_type_tcp.clone());
+                    map.insert("from_udp".to_owned(), prev.nat_type_udp.clone());
+                    map.insert("to_tcp".to_owned(), new_nat_type.nat_type_for_tcp.clone());
+                    map.insert("to_udp".to_owned(), new_nat_type.nat_type_for_udp.clone());
+
+                    info!(
+                        "ChangeNatType {:<8} {}",
+                        HexFmt(peer_key.0),
+                        unwrap!(serde_json::to_string(&map))
+                    );
+
+                    prev.nat_type_tcp = new_nat_type.nat_type_for_tcp;
+                    prev.nat_type_udp = new_nat_type.nat_type_for_udp;
+                });
+            }
             Rpc::UploadLog(log) => {
                 let json = serde_json::to_string(&log)?;
                 info!("UploadLog {:<8} {}", HexFmt(peer_key), json);
