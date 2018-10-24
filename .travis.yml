@@ -26,7 +26,7 @@ before_cache:
 before_deploy:
   - bash cargo_install.sh cargo-script 0.2.8
   - mkdir -p target/deploy
-  - ./scripts/package.rs -c --name client -d target/deploy
+  - ./package.rs -c --name client -d target/deploy
   # Set up git user name and tag this commit
   - git config --local user.name "Nikita Baksalyar"
   - git config --local user.email "nikita.baksalyar@maidsafe.net"
