@@ -29,7 +29,7 @@ use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
-const TARGET_LINUX_X64: &str = "x86_64-unknown-linux-gnu";
+const TARGET_LINUX_X64: &str = "x86_64-unknown-linux-musl";
 const TARGET_OSX_X64: &str = "x86_64-apple-darwin";
 const TARGET_WINDOWS_X64: &str = "x86_64-pc-windows-gnu";
 
@@ -113,6 +113,7 @@ fn main() {
     let target_dir = env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
 
     let file_options = FileOptions::default();
+    let executable_options = FileOptions::default().unix_permissions(0o755);
 
     setup_env(toolchain_path, arch);
 
@@ -138,8 +139,10 @@ fn main() {
 
         for path in executables {
             archive
-                .start_file(path.file_name().unwrap().to_string_lossy(), file_options)
-                .unwrap();
+                .start_file(
+                    path.file_name().unwrap().to_string_lossy(),
+                    executable_options,
+                ).unwrap();
 
             let mut file = File::open(path).unwrap();
             io::copy(&mut file, &mut archive).unwrap();
